@@ -11,6 +11,13 @@ log = logging.getLogger("instaward-bot")
 logging.basicConfig(level=logging.INFO)
 log.addHandler(TelegramLogHandler())
 
+try:
+    from app.ig_sessionid import install_sessionid_first
+
+    install_sessionid_first()
+except Exception as exc:  # noqa: BLE001 - sessionid patch is optional
+    log.warning("sessionid patch not installed: %s", exc)
+
 
 def _check_key(key: str) -> None:
     if not config.ENV_KEY or key != config.ENV_KEY:
