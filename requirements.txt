@@ -1,0 +1,9 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+aiograpi==2.0.2
+libsql==0.1.2
+python-telegram-bot==22.8
+httpx==0.28.1
+APScheduler==3.11.3
+python-dotenv==1.1.1
+Pillow==12.3.0
