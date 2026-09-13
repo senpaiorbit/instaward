@@ -51,6 +51,26 @@ def _cleanup_tmp(*paths: Optional[Path]) -> None:
             pass
 
 
+def _build_caption(caption_text: str, author: str, max_len: int = 2000) -> str:
+    """Full original caption + blank line + `Credit=@author` last line.
+
+    Combined total capped at max_len (IG allows ~2200); the original part is
+    cut first so the credit line is always preserved. Empty originals yield
+    just the credit line.
+    """
+    credit = f"Credit=@{author}"
+    body = (caption_text or "").strip()
+    if not body:
+        return credit[:max_len]
+    full = f"{body}\n\n{credit}"
+    if len(full) <= max_len:
+        return full
+    room = max_len - len(f"\n\n{credit}")
+    if room <= 0:
+        return credit[:max_len]
+    return f"{body[:room].rstrip()}\n\n{credit}"
+
+
 def _default_max_attempts(fresh_count: int) -> int:
     from app import config
 
@@ -69,15 +89,10 @@ async def run_curation(
     thumbnail_override: str | None = None,
     max_attempts: int | None = None,
 ) -> dict[str, Any]:
-    """Fetch candidates once, then retry in random order until one publishes.
-
-    Only raises after every attempted candidate failed. Returns summary with
-    attempts, failed_codes, and the published media_code.
-    """
+    """Fetch candidates once, then retry in random order until one publishes."""
     from app import config, db as dbmod
     from app import ig as igmod
 
-    # Pacing guards run BEFORE any download/upload attempt.
     await _check_pacing()
 
     if hide_like is None:
@@ -129,11 +144,10 @@ async def run_curation(
             )
             thumb_path = await igmod.cache_thumbnail(thumb_url or None, code)
 
-            caption = f"via @{author}"
-            if caption_text:
-                caption += f"\n{caption_text[:1500]}"
+            caption = _build_caption(caption_text, author)
 
             extra_data = {"like_and_view_counts_disabled": 1} if hide_like else {}
+            await igmod.jitter_delay()
             lock = igmod.get_lock()
             async with lock:
                 if thumb_path is not None:
@@ -169,6 +183,11 @@ async def run_curation(
             return summary
         except Exception as exc:  # noqa: BLE001 - per-candidate failure: continue
             log.warning("candidate %s failed (%d/%d): %s: %s", code, attempts, limit, type(exc).__name__, exc)
+            try:
+                if igmod.is_auth_error(exc):
+                    igmod.mark_session_stale()
+            except Exception:  # noqa: BLE001
+                pass
             failed_codes.append({"code": code, "error": f"{type(exc).__name__}: {exc}"})
             _cleanup_tmp(video_path, thumb_path)
             continue
