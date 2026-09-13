@@ -1,13 +1,17 @@
-"""Sessionid login helpers (2FA bypass). Import-safe: no I/O at import.
+"""Sessionid login helpers (2FA bypass) + runtime compat shims. Import-safe.
 
 Call install_sessionid_first() once at startup (see app/main.py). It wraps
 app.ig.ensure_login so raw session cookies (SESSION_ID / CSRF_TOKEN /
-DS_USER_ID) are tried BEFORE the username/password path. Falls through to
-passwords on any failure. No secrets logged.
+DS_USER_ID) are tried BEFORE the username/password path, and it backfills
+newer helpers (jitter_delay / is_auth_error / mark_session_stale) when the
+deployed app/ig.py predates them. Falls through to passwords on any
+failure. No secrets logged.
 """
+import asyncio
 import inspect
 import logging
 import os
+import random
 from typing import Any
 
 log = logging.getLogger("instaward-bot")
@@ -24,6 +28,58 @@ def _dump_settings(cl: Any) -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 continue
     return {}
+
+
+def _jitter_bounds() -> tuple[float, float]:
+    try:
+        from app import config as cfg
+
+        lo = float(getattr(cfg, "IG_JITTER_MIN", 1.0))
+        hi = float(getattr(cfg, "IG_JITTER_MAX", 3.0))
+    except Exception:  # noqa: BLE001
+        try:
+            lo = float(os.getenv("IG_JITTER_MIN", "1.0") or 1.0)
+            hi = float(os.getenv("IG_JITTER_MAX", "3.0") or 3.0)
+        except ValueError:
+            lo, hi = 1.0, 3.0
+    if hi < lo:
+        lo, hi = hi, lo
+    return max(0.0, lo), max(0.0, hi)
+
+
+async def jitter_delay() -> None:
+    """Human-like pause before write calls / between paginated reads."""
+    lo, hi = _jitter_bounds()
+    if hi <= 0:
+        return
+    await asyncio.sleep(random.uniform(lo, hi))
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """True for auth/challenge-type failures (session must be invalidated)."""
+    blob = f"{type(exc).__name__} {exc}".lower()
+    keys = (
+        "challenge", "checkpoint", "two_step", "two-step", "two step",
+        "login_required", "login required", "unauthorized", "unauthorised",
+        "401", "invalid session", "session expired", "sessionid",
+        "consent_required", "feedback_required",
+    )
+    return any(k in blob for k in keys)
+
+
+def mark_session_stale() -> None:
+    """Compat no-op when app.ig predates TTL cache; real cache clears itself."""
+    try:
+        from app import ig as igmod
+
+        fn = getattr(igmod, "mark_session_stale", None)
+        if callable(fn) and getattr(fn, "_compat_shim", False) is not True:
+            fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+mark_session_stale._compat_shim = True  # type: ignore[attr-defined]
 
 
 async def _verify_session(cl: Any) -> None:
@@ -175,8 +231,28 @@ async def _try_sessionid_login(cl: Any, dbmod: Any) -> Any | None:
         return None
 
 
+def _install_compat_helpers() -> None:
+    """Backfill newer app.ig helpers when deployed ig.py predates them."""
+    try:
+        from app import ig as igmod
+    except Exception as exc:  # noqa: BLE001
+        log.warning("compat shim skipped (import): %s", exc)
+        return
+    for name, fn in (
+        ("jitter_delay", jitter_delay),
+        ("is_auth_error", is_auth_error),
+        ("mark_session_stale", mark_session_stale),
+    ):
+        try:
+            if not hasattr(igmod, name):
+                setattr(igmod, name, fn)
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def install_sessionid_first() -> None:
     """Wrap app.ig.ensure_login to try session cookies before passwords."""
+    _install_compat_helpers()
     try:
         from app import db as dbmod
         from app import ig as igmod
