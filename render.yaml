@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: instaward-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: TURSO_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: INSTAGRAM_USERNAME
+        sync: false
+      - key: INSTAGRAM_PASSWORD
+        sync: false
+      - key: INSTAGRAM_SESSION_STATE
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ENV_KEY
+        sync: false
+      - key: ARCHIVE_TIME
+        value: 12h
+      - key: ARCHIVE_VIEWS
+        value: 1000
+      - key: HIDELIKE
+        value: 1
+      - key: BOTLOG
+        value: 1
+      - key: THUMBNAIL_URL
+        sync: false
