@@ -1,45 +1,16 @@
-"""Async Instagram client (aiograpi). Import-safe: no login at import.
+"""Sessionid login helpers (2FA bypass). Import-safe: no I/O at import.
 
-Archive policy: real `media_archive` + DB flags; fallback to `media_delete`
-only if archive raises, plus local-only mark. See README.
+Call install_sessionid_first() once at startup (see app/main.py). It wraps
+app.ig.ensure_login so raw session cookies (SESSION_ID / CSRF_TOKEN /
+DS_USER_ID) are tried BEFORE the username/password path. Falls through to
+passwords on any failure. No secrets logged.
 """
-import asyncio
-import hashlib
-import json
+import inspect
 import logging
 import os
-from pathlib import Path
-from typing import Any, Optional
-
-import httpx
+from typing import Any
 
 log = logging.getLogger("instaward-bot")
-
-_client: Any = None
-_lock = asyncio.Lock()
-
-
-def get_lock() -> asyncio.Lock:
-    return _lock
-
-
-def get_client() -> Any:
-    """Singleton aiograpi Client with conservative delays. No I/O."""
-    global _client
-    if _client is None:
-        from aiograpi import Client
-
-        _client = Client(delay_range=[1, 3])
-
-        def _challenge_handler(username: str, choice: Any = None) -> Any:
-            log.warning("instagram challenge required for %s", username)
-            raise RuntimeError(f"Instagram challenge required for {username}")
-
-        try:
-            _client.challenge_code_handler = _challenge_handler
-        except Exception:  # noqa: BLE001 - attribute may vary by version
-            pass
-    return _client
 
 
 def _dump_settings(cl: Any) -> dict[str, Any]:
@@ -57,8 +28,6 @@ def _dump_settings(cl: Any) -> dict[str, Any]:
 
 async def _verify_session(cl: Any) -> None:
     """Light read to prove sessionid cookies work. Raises on failure."""
-    import inspect
-
     username = os.getenv("INSTAGRAM_USERNAME", "")
     errors: list[str] = []
     for attempt in (
@@ -147,39 +116,32 @@ def _inject_instagram_cookies(cl: Any, sessionid: str, csrf: str, ds_user_id: st
         raise RuntimeError("no supported cookie jar found on client")
 
 
-async def _try_sessionid_login(cl: Any, dbmod: Any) -> Any | None:
-    """Attempt sessionid login BEFORE the password path."""
-    import inspect
-
-    from app import config as cfg
-
-    def _live(*names: str) -> str:
-        for n in names:
-            v = os.getenv(n)
-            if v is not None and str(v).strip() != "":
-                return str(v)
+def _clean_cookie(raw: str) -> str:
+    if not raw:
         return ""
+    from urllib.parse import unquote
 
-    raw = getattr(cfg, "INSTAGRAM_SESSIONID", "") or _live(
-        "INSTAGRAM_SESSIONID", "SESSION_ID", "INSTAGRAM_SESSION"
-    )
-    if not raw or not str(raw).strip():
-        return None
-    try:
-        from urllib.parse import unquote
+    s = str(raw).strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return unquote(s).strip().strip("'\" ")
 
-        s = str(raw).strip()
-        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-            s = s[1:-1].strip()
-        sessionid = unquote(s).strip().strip("'\" ")
-    except Exception:  # noqa: BLE001
-        sessionid = str(raw).strip()
+
+def _live_cookie(*names: str) -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return _clean_cookie(str(v))
+    return ""
+
+
+async def _try_sessionid_login(cl: Any, dbmod: Any) -> Any | None:
+    """Attempt sessionid login. Returns client on success, None to fall through."""
+    sessionid = _live_cookie("INSTAGRAM_SESSIONID", "SESSION_ID", "INSTAGRAM_SESSION")
     if not sessionid:
         return None
-    csrf = getattr(cfg, "INSTAGRAM_CSRFTOKEN", "") or _live("INSTAGRAM_CSRFTOKEN", "CSRF_TOKEN")
-    ds_user_id = getattr(cfg, "INSTAGRAM_DS_USER_ID", "") or _live(
-        "INSTAGRAM_DS_USER_ID", "DS_USER_ID"
-    )
+    csrf = _live_cookie("INSTAGRAM_CSRFTOKEN", "CSRF_TOKEN")
+    ds_user_id = _live_cookie("INSTAGRAM_DS_USER_ID", "DS_USER_ID")
     fn = getattr(cl, "login_by_sessionid", None)
     if callable(fn):
         try:
@@ -198,7 +160,7 @@ async def _try_sessionid_login(cl: Any, dbmod: Any) -> Any | None:
         except Exception as exc:  # noqa: BLE001
             log.warning("login_by_sessionid failed, trying cookie inject: %s", type(exc).__name__)
     try:
-        _inject_instagram_cookies(cl, sessionid, str(csrf or "").strip(), str(ds_user_id or "").strip())
+        _inject_instagram_cookies(cl, sessionid, csrf, ds_user_id)
         await _verify_session(cl)
         try:
             dumped = _dump_settings(cl)
@@ -213,57 +175,29 @@ async def _try_sessionid_login(cl: Any, dbmod: Any) -> Any | None:
         return None
 
 
-async def ensure_login() -> Any:
-    """Login via sessionid cookies first (bypasses 2FA), else username/password."""
-    from app import db as dbmod
+def install_sessionid_first() -> None:
+    """Wrap app.ig.ensure_login to try session cookies before passwords."""
+    try:
+        from app import db as dbmod
+        from app import ig as igmod
+    except Exception as exc:  # noqa: BLE001 - never break import
+        log.warning("sessionid patch skipped (import): %s", exc)
+        return
+    if getattr(igmod.ensure_login, "_sessionid_patched", False):
+        return
+    orig = igmod.ensure_login
 
-    async with _lock:
-        cl = get_client()
+    async def wrapped() -> Any:
         try:
-            session_client = await _try_sessionid_login(cl, dbmod)
-        except Exception as exc:  # noqa: BLE001 - never break password path
+            cl = igmod.get_client()
+            async with igmod.get_lock():
+                hit = await _try_sessionid_login(cl, dbmod)
+            if hit is not None:
+                return hit
+        except Exception as exc:  # noqa: BLE001 - fall through to passwords
             log.warning("sessionid attempt errored: %s", exc)
-            session_client = None
-        if session_client is not None:
-            return session_client
-        username = os.getenv("INSTAGRAM_USERNAME", "")
-        password = os.getenv("INSTAGRAM_PASSWORD", "")
-        if not username or not password:
-            raise RuntimeError("INSTAGRAM_USERNAME/INSTAGRAM_PASSWORD are not set")
-        settings: Optional[dict[str, Any]] = None
-        try:
-            cached = await dbmod.load_session("ig_session")
-            if cached:
-                settings = json.loads(cached) if isinstance(cached, str) else cached
-        except Exception as exc:  # noqa: BLE001
-            log.warning("load_session failed: %s", exc)
-        env_state = os.getenv("INSTAGRAM_SESSION_STATE", "")
-        if env_state:
-            try:
-                settings = json.loads(env_state)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("INSTAGRAM_SESSION_STATE is not valid JSON: %s", exc)
-        if settings:
-            try:
-                cl.set_settings(settings)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("set_settings failed: %s", exc)
-        try:
-            await cl.login(username, password)
-        except Exception as exc:  # noqa: BLE001
-            name = type(exc).__name__
-            if "Challenge" in name or "challenge" in str(exc).lower():
-                try:
-                    from app import telegramlog as tg
+        return await orig()
 
-                    await tg.notify_checkpoint(username)
-                except Exception:  # noqa: BLE001
-                    pass
-            raise
-        try:
-            dumped = _dump_settings(cl)
-            if dumped:
-                await dbmod.save_session("ig_session", dumped)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("save_session failed: %s", exc)
-        return cl
+    wrapped._sessionid_patched = True  # type: ignore[attr-defined]
+    igmod.ensure_login = wrapped  # type: ignore[assignment]
+    log.info("sessionid-first login patch installed")
