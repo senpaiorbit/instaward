@@ -1,13 +1,13 @@
 """Archive job: retire stale/low-view reposts (ours only).
 
 Policy:
-- Only DB-tracked rows (processed_media WHERE archived=0 AND archive_scanned=0).
-- For each: resolve OUR repost (repost_code/pk, else own-feed backfill); never
-  touch the source post or any media owned by another account.
-- If age > threshold AND views <= threshold -> retire own repost:
-  photos via media_archive, clips via media_delete (IG API cannot archive clips).
+- all=0: only DB-tracked rows (archived=0 AND archive_scanned=0); retire when
+  age > time AND views <= threshold.
+- all=1: every row with archived=0; retire every live repost found, mark
+  already-gone ones archived, skip unmapped rows (source posts never touched).
+- Retire = photos via media_archive, clips via media_delete (IG API cannot
+  archive clips). Deletion runs ONLY for media owned by our own account.
 - Fallback to local-only mark if retirement fails; NEVER delete others' media.
-- Always set archive_scanned=1 so we never hard-scan everything.
 """
 import logging
 from datetime import datetime, timezone
@@ -338,7 +338,7 @@ async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSE
     return {"code": code, "pk": pk_str, "archived": True, "method": method}
 
 
-async def run_archive(time_sec: int, views_thresh: int, job: dict | None = None) -> dict[str, Any]:
+async def run_archive(time_sec: int, views_thresh: int, job: dict | None = None, all: bool = False) -> dict[str, Any]:
     from app import config
     from app import db as dbmod
     from app import ig as igmod
@@ -348,7 +348,10 @@ async def run_archive(time_sec: int, views_thresh: int, job: dict | None = None)
         batch = int(getattr(config, "ARCHIVE_BATCH", 50) or 50)
     except (TypeError, ValueError):
         batch = 50
-    rows = await dbmod.get_unscanned(limit=max(1, batch))
+    if all:
+        rows = await dbmod.get_unarchived(limit=max(1, batch))
+    else:
+        rows = await dbmod.get_unscanned(limit=max(1, batch))
     checked = archived = kept = 0
     errors: list[str] = []
 
@@ -402,7 +405,9 @@ async def run_archive(time_sec: int, views_thresh: int, job: dict | None = None)
             age_sec = (now - taken_at).total_seconds() if taken_at else 0
 
             should_archive = False
-            if (
+            if all:
+                should_archive = info is not None
+            elif (
                 taken_at
                 and age_sec > time_sec
                 and views is not None
@@ -426,10 +431,21 @@ async def run_archive(time_sec: int, views_thresh: int, job: dict | None = None)
             except Exception:
                 raw_vc = None
             log.info(
-                "archive row %s repost=%s: pk=%s ptype=%s mtype=%s raw_pc=%s raw_vc=%s views=%s taken_at=%s age_sec=%s time_sec=%s views_thresh=%s -> %s",
-                code, target_code, pk, ptype, mtype, raw_pc, raw_vc, views, taken_at, round(age_sec, 1), time_sec, views_thresh,
+                "archive row %s repost=%s: pk=%s ptype=%s mtype=%s raw_pc=%s raw_vc=%s views=%s taken_at=%s age_sec=%s time_sec=%s views_thresh=%s all=%s -> %s",
+                code, target_code, pk, ptype, mtype, raw_pc, raw_vc, views, taken_at, round(age_sec, 1), time_sec, views_thresh, all,
                 "ARCHIVE" if should_archive else "keep",
             )
+
+            if all and info is None:
+                log.info("archive row %s (repost=%s) already gone, marking archived", code, target_code)
+                await dbmod.mark_archived(code, 1)
+                archived += 1
+                if job is not None:
+                    job["checked"] = checked
+                    job["archived"] = archived
+                    job["kept"] = kept
+                    job["errors"] = list(errors)
+                continue
 
             if should_archive:
                 result = await archive_single(cl, target_code, pk=pk, info=info, db_code=code)
