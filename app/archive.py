@@ -3,8 +3,6 @@
 Policy (also in README):
 - Only DB-tracked rows (processed_media WHERE archived=0 AND archive_scanned=0).
 - For each: media_info + insights for age/views.
-- Age is measured from OUR repost time (DB published_at), not the original
-  reel's taken_at, so a fresh repost of an old reel is kept.
 - If age > threshold AND views <= threshold -> media_archive(f"{pk}_{user_id}").
 - Fallback to media_delete only if archive raises; else local-only mark.
 - Always set archive_scanned=1 so we never hard-scan everything.
@@ -30,20 +28,62 @@ def _parse_published_at(raw: Any) -> datetime | None:
         return None
 
 
+def _as_count(v: Any) -> int | None:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    return None
+
+
+def _is_clip_media(obj: Any) -> bool:
+    try:
+        if isinstance(obj, dict):
+            ptype = obj.get("product_type")
+            if isinstance(ptype, str) and ptype.strip().lower() == "clips":
+                return True
+            return "clips_metadata" in obj and obj.get("clips_metadata") is not None
+        ptype = getattr(obj, "product_type", None)
+        if isinstance(ptype, str) and ptype.strip().lower() == "clips":
+            return True
+        return getattr(obj, "clips_metadata", None) is not None
+    except Exception:
+        return False
+
+
 def _extract_views(info: Any, insights: Any) -> int | None:
+    # aiograpi maps Media.play_count from play_count/video_play_count (the
+    # clip metric) and Media.view_count from view_count/video_view_count
+    # (the Video/IGTV metric). For clips, view_count must not stand in.
     for obj in (insights, info):
         if obj is None:
             continue
         if isinstance(obj, dict):
-            for k in ("play_count", "view_count", "views", "plays"):
-                v = obj.get(k)
-                if isinstance(v, (int, float)):
-                    return int(v)
-        else:
-            for k in ("play_count", "view_count"):
-                v = getattr(obj, k, None)
-                if isinstance(v, (int, float)):
-                    return int(v)
+            # GraphQL insights wrapper has no flat media counts.
+            if "inline_insights_node" in obj and not any(
+                k in obj for k in ("play_count", "view_count", "views", "plays")
+            ):
+                continue
+            pc = _as_count(obj.get("play_count"))
+            if pc is not None:
+                return pc
+            if _is_clip_media(obj):
+                continue
+            for k in ("view_count", "views", "plays"):
+                vc = _as_count(obj.get(k))
+                if vc is not None:
+                    return vc
+            continue
+        pc = _as_count(getattr(obj, "play_count", None))
+        if pc is not None:
+            return pc
+        if _is_clip_media(obj):
+            # Clips report views via play_count only; view_count is a
+            # Video/IGTV field and must not trigger archiving.
+            continue
+        vc = _as_count(getattr(obj, "view_count", None))
+        if vc is not None:
+            return vc
     return None
 
 
@@ -138,9 +178,25 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
                 and views <= views_thresh
             ):
                 should_archive = True
+            try:
+                ptype = info.get("product_type") if isinstance(info, dict) else getattr(info, "product_type", None)
+            except Exception:
+                ptype = None
+            try:
+                mtype = info.get("media_type") if isinstance(info, dict) else getattr(info, "media_type", None)
+            except Exception:
+                mtype = None
+            try:
+                raw_pc = info.get("play_count") if isinstance(info, dict) else getattr(info, "play_count", None)
+            except Exception:
+                raw_pc = None
+            try:
+                raw_vc = info.get("view_count") if isinstance(info, dict) else getattr(info, "view_count", None)
+            except Exception:
+                raw_vc = None
             log.info(
-                "archive row %s: pk=%s views=%s taken_at=%s age_sec=%s time_sec=%s views_thresh=%s -> %s",
-                code, pk, views, taken_at, round(age_sec, 1), time_sec, views_thresh,
+                "archive row %s: pk=%s ptype=%s mtype=%s raw_pc=%s raw_vc=%s views=%s taken_at=%s age_sec=%s time_sec=%s views_thresh=%s -> %s",
+                code, pk, ptype, mtype, raw_pc, raw_vc, views, taken_at, round(age_sec, 1), time_sec, views_thresh,
                 "ARCHIVE" if should_archive else "keep",
             )
 
