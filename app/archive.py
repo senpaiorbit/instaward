@@ -116,26 +116,68 @@ _UNSET: Any = object()
 
 
 async def _archive_media_once(cl: Any, code: str, pk: Any, info: Any) -> str:
-    """Single-attempt archive; fallback is local-only mark. No delete."""
+    """Try archive variants in order; fallback is local-only mark. No delete."""
     from app import ig as igmod
 
-    user_id = getattr(getattr(info, "user", None), "pk", None) or getattr(
+    pk_str = str(pk)
+    owner = getattr(getattr(info, "user", None), "pk", None) or getattr(
         getattr(info, "user", None), "id", ""
     )
-    media_id = f"{pk}_{user_id}" if user_id else pk
+    owner = str(owner or "").strip()
+    self_uid = str(getattr(cl, "user_id", "") or "")
+    full_id = f"{pk_str}_{owner}" if owner else pk_str
+    log.info(
+        "archive try %s pk=%s owner=%s self=%s full=%s",
+        code, pk_str, owner, self_uid, full_id,
+    )
     await igmod.jitter_delay()
     lock = igmod.get_lock()
-    async with lock:
+
+    async def _attempt(label: str, fn: Any) -> bool:
         try:
-            await cl.media_archive(media_id)
-            log.info("archived %s via media_archive", code)
-            return "archive"
-        except Exception as arch_exc:  # noqa: BLE001
-            if igmod.is_auth_error(arch_exc):
+            res = fn()
+            import inspect
+            if inspect.isawaitable(res):
+                res = await res
+            ok = res is True or (isinstance(res, dict) and res.get("status") == "ok")
+            log.info("archive variant %s(%s) -> %r", label, code, res)
+            return bool(ok)
+        except Exception as exc:  # noqa: BLE001
+            if igmod.is_auth_error(exc):
                 igmod.mark_session_stale()
                 raise
-            log.warning("media_archive(%s) failed, local-only mark: %s", code, arch_exc)
-            return "local"
+            log.warning("archive variant %s(%s) failed: %s: %s", label, code, type(exc).__name__, exc)
+            return False
+
+    async with lock:
+        # 1) pk-only: lets aiograpi resolve the true owner via media_user().
+        if await _attempt("pk-only", lambda: cl.media_archive(pk_str)):
+            return "archive:pk-only"
+        # 2) full id via library (previous behaviour).
+        if full_id != pk_str and await _attempt("full-id", lambda: cl.media_archive(full_id)):
+            return "archive:full-id"
+        # 3) direct endpoint with pk in URL, full id in body.
+        try:
+            data = cl.with_action_data({"media_id": full_id})
+            if await _attempt(
+                "direct-pk-url",
+                lambda: cl.private_request(f"media/{pk_str}/only_me/", data),
+            ):
+                return "archive:direct-pk-url"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("archive variant direct-pk-url(%s) setup failed: %s", code, exc)
+        # 4) legacy payload (instagrapi-style: _uid + radio_type).
+        try:
+            payload = {"_uid": self_uid or owner, "media_id": full_id, "radio_type": "normal"}
+            if await _attempt(
+                "legacy-payload",
+                lambda: cl.private_request(f"media/{full_id}/only_me/", payload),
+            ):
+                return "archive:legacy-payload"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("archive variant legacy-payload(%s) setup failed: %s", code, exc)
+        log.warning("all archive variants failed for %s, local-only mark", code)
+        return "local"
 
 
 async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSET) -> dict[str, Any]:
