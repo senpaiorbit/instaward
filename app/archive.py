@@ -3,7 +3,9 @@
 Policy (also in README):
 - Only DB-tracked rows (processed_media WHERE archived=0 AND archive_scanned=0).
 - For each: media_info + insights for age/views.
-- If age > threshold OR views < threshold -> media_archive(f"{pk}_{user_id}").
+- Age is measured from OUR repost time (DB published_at), not the original
+  reel's taken_at, so a fresh repost of an old reel is kept.
+- If age > threshold OR views <= threshold -> media_archive(f"{pk}_{user_id}").
 - Fallback to media_delete only if archive raises; else local-only mark.
 - Always set archive_scanned=1 so we never hard-scan everything.
 """
@@ -76,11 +78,16 @@ async def _resolve_pk(cl: Any, code: str) -> Any | None:
 
 
 async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
+    from app import config
     from app import db as dbmod
     from app import ig as igmod
 
     cl = await igmod.ensure_login()
-    rows = await dbmod.get_unscanned(limit=50)
+    try:
+        batch = int(getattr(config, "ARCHIVE_BATCH", 50) or 50)
+    except (TypeError, ValueError):
+        batch = 50
+    rows = await dbmod.get_unscanned(limit=max(1, batch))
     checked = archived = kept = 0
     errors: list[str] = []
 
@@ -95,62 +102,82 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
             if pk is not None:
                 async with lock:
                     try:
-                        info = await cl.media_info(pk)
+                        info = await igmod.read_with_backoff("media_info", cl.media_info, pk)
                     except Exception as exc:  # noqa: BLE001
-                        log.warning("media_info(%s) failed: %s", code, exc)
-                    try:
-                        fn = getattr(cl, "insights_media", None)
-                        if fn is not None:
-                            insights = await fn(pk)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("insights_media(%s) failed: %s", code, exc)
+                        log.warning("media_info(%s) failed: %s: %s", code, type(exc).__name__, exc)
+                        if igmod.is_auth_error(exc):
+                            raise
+                    # Skip insights when media_info already carries views.
+                    if _extract_views(info, None) is None:
+                        try:
+                            fn = getattr(cl, "insights_media", None)
+                            if fn is not None:
+                                insights = await igmod.read_with_backoff("insights_media", fn, pk)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("insights_media(%s) failed: %s: %s", code, type(exc).__name__, exc)
+                            if igmod.is_auth_error(exc):
+                                raise
 
             views = _extract_views(info, insights)
-            taken_at = _extract_taken_at(info) or _parse_published_at(row.get("published_at"))
+            # Age is measured from OUR repost time (DB published_at) first;
+            # the original reel's taken_at is only a fallback.
+            taken_at = _parse_published_at(row.get("published_at")) or _extract_taken_at(info)
             now = datetime.now(timezone.utc)
             age_sec = (now - taken_at).total_seconds() if taken_at else 0
 
             should_archive = False
             if taken_at and age_sec > time_sec:
                 should_archive = True
-            if views is not None and views < views_thresh:
+            if views is not None and views <= views_thresh:
                 should_archive = True
-
-            if pk is None and taken_at is None:
-                pass
 
             if should_archive and pk is not None:
                 user_id = getattr(getattr(info, "user", None), "pk", None) or getattr(
                     getattr(info, "user", None), "id", ""
                 )
                 media_id = f"{pk}_{user_id}" if user_id else pk
+                # Single attempt per write (never retried blindly); failures
+                # fall back to delete once, then local-only mark.
+                await igmod.jitter_delay()
                 async with lock:
                     try:
                         await cl.media_archive(media_id)
                     except Exception as arch_exc:  # noqa: BLE001
+                        if igmod.is_auth_error(arch_exc):
+                            igmod.mark_session_stale()
+                            raise
                         log.warning("media_archive(%s) failed, trying delete: %s", code, arch_exc)
                         try:
                             await cl.media_delete(pk)
                         except Exception as del_exc:  # noqa: BLE001
+                            if igmod.is_auth_error(del_exc):
+                                igmod.mark_session_stale()
+                                raise
                             log.warning("media_delete(%s) failed, local-only mark: %s", code, del_exc)
                 await dbmod.mark_archived(code, 1)
                 archived += 1
             elif should_archive and pk is None:
+                # Cannot call API without pk -> local-only mark as archived
                 await dbmod.mark_archived(code, 1)
                 archived += 1
             else:
                 await dbmod.mark_scanned(code, 0)
                 kept += 1
         except Exception as exc:  # noqa: BLE001
+            try:
+                if igmod.is_auth_error(exc):
+                    igmod.mark_session_stale()
+            except Exception:  # noqa: BLE001
+                pass
             errors.append(f"{code}: {type(exc).__name__}: {exc}")
-            log.warning("archive row %s failed: %s", code, exc)
+            log.warning("archive row %s failed: %s: %s", code, type(exc).__name__, exc)
 
     summary = {"checked": checked, "archived": archived, "kept": kept, "errors": errors}
     try:
         from app import telegramlog as tg
 
         if checked:
-            await tg.send_message(f"archive scan: checked={checked} archived={archived} kept={kept}")
+            await tg.send_message(f"🗄 archive scan: checked={checked} archived={archived} kept={kept}")
     except Exception:  # noqa: BLE001
         pass
     return summary
