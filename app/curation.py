@@ -140,6 +140,7 @@ async def run_curation(
     max_attempts: int | None = None,
     target_count: int = 1,
     job: dict | None = None,
+    comment: bool | None = None,
 ) -> dict[str, Any]:
     """Fetch candidates once, then retry in random order until target publishes.
 
@@ -163,6 +164,10 @@ async def run_curation(
 
     if hide_like is None:
         hide_like = bool(config.HIDELIKE)
+    if comment is None:
+        comment_enabled = bool(int(getattr(config, "COMMENT_ENABLED", 0) or 0))
+    else:
+        comment_enabled = bool(comment)
 
     try:
         want = max(1, int(target_count or 1))
@@ -290,7 +295,7 @@ async def run_curation(
             comment_text = ""
             if not (repost_code or repost_pk):
                 log.info("comment skipped src=%s (no repost identity)", code)
-            elif int(getattr(config, "COMMENT_ENABLED", 1) or 0) and str(
+            elif comment_enabled and str(
                 getattr(config, "COMMENT_TEXT", "") or ""
             ).strip():
                 try:
