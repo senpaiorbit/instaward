@@ -147,8 +147,6 @@ async def archive_one(
         return {"ok": True, "summary": summary}
     except HTTPException:
         raise
-    except Exception:
-        raise
     except Exception as exc:  # noqa: BLE001
         await tg.notify_error("archive_one", exc)
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
