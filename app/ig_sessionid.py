@@ -1,18 +1,19 @@
 """Sessionid login helpers (2FA bypass) + runtime compat shims. Import-safe.
 
 Call install_sessionid_first() once at startup (see app/main.py). It wraps
-app.ig.ensure_login so raw session cookies (SESSION_ID / CSRF_TOKEN /
-DS_USER_ID) are tried BEFORE the username/password path, and it backfills
-newer helpers (jitter_delay / is_auth_error / mark_session_stale) when the
-deployed app/ig.py predates them. Falls through to passwords on any
-failure. No secrets logged.
+app.ig.ensure_login with: (1) raw session cookies tried first, (2) 2FA-aware
+password login (TOTP seed or one-shot code) when cookies are absent/expired,
+(3) backfilled newer helpers (jitter_delay / is_auth_error /
+mark_session_stale) when the deployed app/ig.py predates them. Falls through
+to the original password flow when nothing is configured. No secrets logged.
 """
 import asyncio
 import inspect
+import json
 import logging
 import os
 import random
-from typing import Any
+from typing import Any, Optional
 
 log = logging.getLogger("instaward-bot")
 
@@ -65,6 +66,13 @@ def is_auth_error(exc: BaseException) -> bool:
         "consent_required", "feedback_required",
     )
     return any(k in blob for k in keys)
+
+
+def _is_two_factor_error(exc: BaseException) -> bool:
+    blob = f"{type(exc).__name__} {exc}".lower()
+    if "two" in blob and ("factor" in blob or "step" in blob):
+        return True
+    return "verification" in blob or "login_required" in blob
 
 
 def mark_session_stale() -> None:
@@ -191,6 +199,29 @@ def _live_cookie(*names: str) -> str:
     return ""
 
 
+def _clean_secret(raw: str) -> str:
+    return _clean_cookie(raw).replace(" ", "")
+
+
+def _resolve_2fa_code(cl: Any) -> tuple[str, str]:
+    """Return (code, source). Source is totp/manual/none. Secrets never logged."""
+    seed = _clean_secret(_live_cookie("INSTAGRAM_TOTP_SEED"))
+    one_shot = _clean_cookie(_live_cookie("INSTAGRAM_2FA_CODE"))
+    if seed:
+        totp_fn = getattr(cl, "totp_generate_code", None)
+        if callable(totp_fn):
+            try:
+                gen = totp_fn(seed)
+                code = str(gen or "").strip()
+                if code:
+                    return code, "totp"
+            except Exception as gexc:  # noqa: BLE001
+                log.warning("totp code generation failed: %s", type(gexc).__name__)
+    if one_shot:
+        return one_shot, "manual"
+    return "", "none"
+
+
 async def _try_sessionid_login(cl: Any, dbmod: Any) -> Any | None:
     """Attempt sessionid login. Returns client on success, None to fall through."""
     sessionid = _live_cookie("INSTAGRAM_SESSIONID", "SESSION_ID", "INSTAGRAM_SESSION")
@@ -231,6 +262,63 @@ async def _try_sessionid_login(cl: Any, dbmod: Any) -> Any | None:
         return None
 
 
+async def _password_login_with_2fa(cl: Any, dbmod: Any) -> Any | None:
+    """Username/password login with single 2FA attempt. None when unconfigured."""
+    username = os.getenv("INSTAGRAM_USERNAME", "")
+    password = os.getenv("INSTAGRAM_PASSWORD", "")
+    if not username or not password:
+        return None
+    try:
+        cached = await dbmod.load_session("ig_session")
+        settings: Optional[dict[str, Any]] = None
+        if cached:
+            try:
+                settings = json.loads(cached) if isinstance(cached, str) else cached
+            except Exception:  # noqa: BLE001
+                settings = None
+        if settings:
+            try:
+                cl.set_settings(settings)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning("load_session failed: %s", exc)
+    try:
+        await cl.login(username, password)
+        _persist_session(dbmod, cl)
+        return cl
+    except Exception as exc:  # noqa: BLE001
+        if not _is_two_factor_error(exc):
+            raise
+    code, source = _resolve_2fa_code(cl)
+    if not code:
+        log.warning("2FA required but no code source configured (source=none)")
+        return None
+    log.info("2FA verification required; single verification attempt (source=%s)", source)
+    await cl.login(username, password, verification_code=code)
+    _persist_session(dbmod, cl)
+    log.info("instagram password+2fa login succeeded (source=%s)", source)
+    return cl
+
+
+def _persist_session(dbmod: Any, cl: Any) -> None:
+    import asyncio as _asyncio
+
+    async def _save() -> None:
+        try:
+            dumped = _dump_settings(cl)
+            if dumped:
+                await dbmod.save_session("ig_session", dumped)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("save_session failed: %s", exc)
+
+    try:
+        loop = _asyncio.get_running_loop()
+        loop.create_task(_save())
+    except RuntimeError:
+        pass
+
+
 def _install_compat_helpers() -> None:
     """Backfill newer app.ig helpers when deployed ig.py predates them."""
     try:
@@ -251,7 +339,7 @@ def _install_compat_helpers() -> None:
 
 
 def install_sessionid_first() -> None:
-    """Wrap app.ig.ensure_login to try session cookies before passwords."""
+    """Wrap app.ig.ensure_login: cookies, then 2FA password, then original."""
     _install_compat_helpers()
     try:
         from app import db as dbmod
@@ -272,6 +360,14 @@ def install_sessionid_first() -> None:
                 return hit
         except Exception as exc:  # noqa: BLE001 - fall through to passwords
             log.warning("sessionid attempt errored: %s", exc)
+        try:
+            cl = igmod.get_client()
+            async with igmod.get_lock():
+                hit2 = await _password_login_with_2fa(cl, dbmod)
+            if hit2 is not None:
+                return hit2
+        except Exception as exc:  # noqa: BLE001 - fall through to original
+            log.warning("2fa password attempt errored: %s", type(exc).__name__)
         return await orig()
 
     wrapped._sessionid_patched = True  # type: ignore[attr-defined]
