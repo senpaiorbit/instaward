@@ -142,6 +142,7 @@ async def archive(
     time: str | None = Query(None),
     views: int | None = Query(None),
     wait: int | None = Query(None),
+    all: int | None = Query(None),
 ) -> dict:
     _check_key(key)
     from app import telegramlog as tg
@@ -152,10 +153,11 @@ async def archive(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     views_thresh = config.ARCHIVE_VIEWS if views is None else views
+    all_flag = bool(all)
     if wait:
         try:
-            summary = await run_archive(time_sec, views_thresh)
-            return {"ok": True, "time_sec": time_sec, "views": views_thresh, "summary": summary}
+            summary = await run_archive(time_sec, views_thresh, all=all_flag)
+            return {"ok": True, "time_sec": time_sec, "views": views_thresh, "all": all_flag, "summary": summary}
         except Exception as exc:  # noqa: BLE001
             await tg.notify_error("archive", exc)
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
@@ -170,16 +172,18 @@ async def archive(
             "status": "running",
             "time_sec": time_sec,
             "views": views_thresh,
+            "all": all_flag,
             "note": "already running",
         }
-    job = jobsmod.create_job("archive", {"time_sec": time_sec, "views": views_thresh})
-    asyncio.create_task(jobsmod.run_archive_job(job["id"], time_sec, views_thresh))
+    job = jobsmod.create_job("archive", {"time_sec": time_sec, "views": views_thresh, "all": all_flag})
+    asyncio.create_task(jobsmod.run_archive_job(job["id"], time_sec, views_thresh, all_flag))
     return {
         "ok": True,
         "job_id": job["id"],
         "status": "running",
         "time_sec": time_sec,
         "views": views_thresh,
+        "all": all_flag,
     }
 
 
