@@ -5,7 +5,9 @@ CREATE TABLE IF NOT EXISTS processed_media (
   cached_download_url TEXT,
   published_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   archived INTEGER DEFAULT 0,
-  archive_scanned INTEGER DEFAULT 0
+  archive_scanned INTEGER DEFAULT 0,
+  repost_code TEXT,
+  repost_pk TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_cache (

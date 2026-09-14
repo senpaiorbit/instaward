@@ -1,9 +1,12 @@
 """Turso (libsql) storage. Sync client wrapped via asyncio.to_thread. Import-safe."""
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
+
+log = logging.getLogger("instaward-bot")
 
 _SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema.sql"
 _FALLBACK_SCHEMA = """
@@ -14,7 +17,9 @@ CREATE TABLE IF NOT EXISTS processed_media (
   cached_download_url TEXT,
   published_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   archived INTEGER DEFAULT 0,
-  archive_scanned INTEGER DEFAULT 0
+  archive_scanned INTEGER DEFAULT 0,
+  repost_code TEXT,
+  repost_pk TEXT
 );
 CREATE TABLE IF NOT EXISTS session_cache (
   key TEXT PRIMARY KEY,
@@ -51,6 +56,17 @@ def _init_db_sync() -> None:
     try:
         con.executescript(_load_schema_sql())
         con.commit()
+        for _ddl in (
+            "ALTER TABLE processed_media ADD COLUMN repost_code TEXT",
+            "ALTER TABLE processed_media ADD COLUMN repost_pk TEXT",
+        ):
+            try:
+                con.execute(_ddl)
+                con.commit()
+            except Exception as exc:  # noqa: BLE001
+                if "duplicate" in str(exc).lower():
+                    continue
+                log.warning("migration %s failed: %s", _ddl, exc)
     finally:
         con.close()
 
@@ -90,7 +106,8 @@ def _get_recent_sync(limit: int = 5) -> list[dict[str, Any]]:
     con = _connect()
     try:
         rows = con.execute(
-            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned"
+            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned,"
+            " repost_code, repost_pk"
             " FROM processed_media ORDER BY published_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -102,6 +119,8 @@ def _get_recent_sync(limit: int = 5) -> list[dict[str, Any]]:
                 "published_at": r[3],
                 "archived": r[4],
                 "archive_scanned": r[5],
+                "repost_code": r[6] if len(r) > 6 else None,
+                "repost_pk": r[7] if len(r) > 7 else None,
             }
             for r in rows
         ]
@@ -113,7 +132,8 @@ def _get_archive_candidates_sync(limit: int = 50) -> list[dict[str, Any]]:
     con = _connect()
     try:
         rows = con.execute(
-            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned"
+            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned,"
+            " repost_code, repost_pk"
             " FROM processed_media WHERE archived = 0 AND archive_scanned = 0"
             " ORDER BY published_at ASC LIMIT ?",
             (limit,),
@@ -126,6 +146,8 @@ def _get_archive_candidates_sync(limit: int = 50) -> list[dict[str, Any]]:
                 "published_at": r[3],
                 "archived": r[4],
                 "archive_scanned": r[5],
+                "repost_code": r[6] if len(r) > 6 else None,
+                "repost_pk": r[7] if len(r) > 7 else None,
             }
             for r in rows
         ]
@@ -151,6 +173,18 @@ def _mark_scanned_sync(code: str, archived: int = 0) -> None:
         con.execute(
             "UPDATE processed_media SET archived = ?, archive_scanned = 1 WHERE media_code = ?",
             (1 if archived else 0, code),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _update_repost_sync(code: str, repost_code: str, repost_pk: str) -> None:
+    con = _connect()
+    try:
+        con.execute(
+            "UPDATE processed_media SET repost_code = ?, repost_pk = ? WHERE media_code = ?",
+            (repost_code, repost_pk, code),
         )
         con.commit()
     finally:
@@ -237,6 +271,10 @@ async def mark_archived(code: str, archived: int = 1) -> None:
 
 async def mark_scanned(code: str, archived: int = 0) -> None:
     await asyncio.to_thread(_mark_scanned_sync, code, archived)
+
+
+async def update_repost(code: str, repost_code: str, repost_pk: str) -> None:
+    await asyncio.to_thread(_update_repost_sync, code, repost_code, repost_pk)
 
 
 async def last_published_at() -> Optional[str]:

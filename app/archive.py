@@ -180,7 +180,95 @@ async def _archive_media_once(cl: Any, code: str, pk: Any, info: Any) -> str:
         return "local"
 
 
-async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSET) -> dict[str, Any]:
+async def _find_own_repost(cl: Any, author: str, published_at_raw: Any) -> tuple[str, str] | None:
+    """Find our own repost matching Credit=@author near published_at.
+
+    Returns (code, pk) of first match else None. Never raises except auth
+    errors propagated by read_with_backoff. Handles Media objects and dicts.
+    """
+    from app import ig as igmod
+
+    try:
+        published_at = _parse_published_at(published_at_raw)
+        try:
+            self_uid = int(getattr(cl, "user_id", 0) or 0)
+        except (TypeError, ValueError):
+            self_uid = 0
+        want = f"Credit=@{author}"
+        lock = igmod.get_lock()
+        async with lock:
+            items = await igmod.read_with_backoff("user_medias", cl.user_medias_v1, self_uid, 50)
+        if isinstance(items, dict):
+            items = items.get("medias", items.get("items", []))
+        else:
+            medias_attr = getattr(items, "medias", None)
+            if medias_attr is not None:
+                try:
+                    items = list(medias_attr)
+                except TypeError:
+                    items = medias_attr
+        try:
+            seq = list(items or [])
+        except TypeError:
+            seq = []
+        for m in seq:
+            try:
+                caption: Any = getattr(m, "caption_text", None)
+                if caption is None and isinstance(m, dict):
+                    caption = m.get("caption_text")
+                if caption is None:
+                    cap_obj: Any = getattr(m, "caption", None) if not isinstance(m, dict) else m.get("caption")
+                    if cap_obj is not None:
+                        if isinstance(cap_obj, dict):
+                            caption = cap_obj.get("text")
+                        else:
+                            caption = getattr(cap_obj, "text", None)
+                caption_s = str(caption or "")
+                if want not in caption_s:
+                    continue
+                raw_taken: Any = m.get("taken_at") if isinstance(m, dict) else getattr(m, "taken_at", None)
+                taken_dt: datetime | None = None
+                if isinstance(raw_taken, datetime):
+                    taken_dt = raw_taken
+                    if taken_dt.tzinfo is None:
+                        taken_dt = taken_dt.replace(tzinfo=timezone.utc)
+                else:
+                    taken_dt = _parse_published_at(raw_taken)
+                if published_at is not None and taken_dt is not None:
+                    if abs((taken_dt - published_at).total_seconds()) > 45 * 60:
+                        continue
+                if isinstance(m, dict):
+                    mcode = str(m.get("code") or "")
+                    mpk = str(m.get("pk") or "")
+                    if not mpk and m.get("id") is not None:
+                        mpk = str(m.get("id")).split("_")[0]
+                else:
+                    mcode = str(getattr(m, "code", "") or "")
+                    mpk = str(getattr(m, "pk", "") or "")
+                    if not mpk and getattr(m, "id", None) is not None:
+                        mpk = str(getattr(m, "id")).split("_")[0]
+                if not mcode and not mpk:
+                    continue
+                log.info("found own repost for @%s: repost=%s pk=%s", author, mcode, mpk)
+                return (mcode, mpk)
+            except Exception:  # noqa: BLE001
+                continue
+        log.info("no own repost found for @%s", author)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        try:
+            from app import ig as _igcheck
+
+            _is_auth = _igcheck.is_auth_error(exc)
+        except Exception:  # noqa: BLE001
+            _is_auth = False
+        if _is_auth:
+            raise
+        log.warning("_find_own_repost(@%s) failed: %s: %s", author, type(exc).__name__, exc)
+        return None
+
+
+async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSET, db_code: str | None = None) -> dict[str, Any]:
     """Archive ONE shortcode, bypassing DB age/views gating."""
     from app import db as dbmod
     from app import ig as igmod
@@ -191,7 +279,7 @@ async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSE
     log.info("archive_single %s resolved pk=%s", code, pk)
     if pk is None:
         log.warning("archive_single %s: no pk, local-only mark", code)
-        await dbmod.mark_archived(code, 1)
+        await dbmod.mark_archived((db_code or code), 1)
         log.info("archive_single %s done method=local (unresolved pk)", code)
         return {"code": code, "pk": None, "archived": True, "method": "local", "reason": "unresolved-pk"}
     if info is _UNSET:
@@ -210,7 +298,7 @@ async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSE
     else:
         log.info("archive_single %s using provided pk=%s info", code, pk)
     method = await _archive_media_once(cl, code, pk, info)
-    await dbmod.mark_archived(code, 1)
+    await dbmod.mark_archived((db_code or code), 1)
     log.info("archive_single %s done method=%s", code, method)
     try:
         pk_str: Any = str(pk)
@@ -237,7 +325,20 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
         code = row["media_code"]
         checked += 1
         try:
-            pk = await _resolve_pk(cl, code)
+            target_code = str(row.get("repost_code") or "")
+            target_pk: Any = row.get("repost_pk") or ""
+            if not target_code and not target_pk:
+                found = await _find_own_repost(cl, str(row.get("author_username") or ""), row.get("published_at"))
+                if found is not None:
+                    rcode, rpk = found
+                    await dbmod.update_repost(code, rcode, rpk)
+                    target_code, target_pk = rcode, rpk
+                else:
+                    log.warning("archive row %s: no repost mapping, skip (source post is not ours)", code)
+                    await dbmod.mark_scanned(code, 0)
+                    kept += 1
+                    continue
+            pk = target_pk or await _resolve_pk(cl, target_code)
             info: Any = None
             insights: Any = None
             lock = igmod.get_lock()
@@ -246,7 +347,7 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
                     try:
                         info = await igmod.read_with_backoff("media_info", cl.media_info, pk)
                     except Exception as exc:  # noqa: BLE001
-                        log.warning("media_info(%s) failed: %s: %s", code, type(exc).__name__, exc)
+                        log.warning("media_info(%s) failed: %s: %s", target_code, type(exc).__name__, exc)
                         if igmod.is_auth_error(exc):
                             raise
                     if _extract_views(info, None) is None:
@@ -255,7 +356,7 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
                             if fn is not None:
                                 insights = await igmod.read_with_backoff("insights_media", fn, pk)
                         except Exception as exc:  # noqa: BLE001
-                            log.warning("insights_media(%s) failed: %s: %s", code, type(exc).__name__, exc)
+                            log.warning("insights_media(%s) failed: %s: %s", target_code, type(exc).__name__, exc)
                             if igmod.is_auth_error(exc):
                                 raise
 
@@ -289,14 +390,14 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
             except Exception:
                 raw_vc = None
             log.info(
-                "archive row %s: pk=%s ptype=%s mtype=%s raw_pc=%s raw_vc=%s views=%s taken_at=%s age_sec=%s time_sec=%s views_thresh=%s -> %s",
-                code, pk, ptype, mtype, raw_pc, raw_vc, views, taken_at, round(age_sec, 1), time_sec, views_thresh,
+                "archive row %s repost=%s: pk=%s ptype=%s mtype=%s raw_pc=%s raw_vc=%s views=%s taken_at=%s age_sec=%s time_sec=%s views_thresh=%s -> %s",
+                code, target_code, pk, ptype, mtype, raw_pc, raw_vc, views, taken_at, round(age_sec, 1), time_sec, views_thresh,
                 "ARCHIVE" if should_archive else "keep",
             )
 
             if should_archive:
-                result = await archive_single(cl, code, pk=pk, info=info)
-                log.info("archive row %s archived via %s", code, result.get("method"))
+                result = await archive_single(cl, target_code, pk=pk, info=info, db_code=code)
+                log.info("archive row %s (repost=%s) archived via %s", code, target_code, result.get("method"))
                 archived += 1
             else:
                 await dbmod.mark_scanned(code, 0)

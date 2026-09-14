@@ -21,6 +21,7 @@ async def _check_pacing() -> None:
     last = await dbmod.last_published_at()
     if last:
         try:
+            # SQLite CURRENT_TIMESTAMP is "YYYY-MM-DD HH:MM:SS" (UTC, naive)
             dt = datetime.fromisoformat(str(last).replace("Z", ""))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
@@ -84,15 +85,66 @@ def _default_max_attempts(fresh_count: int) -> int:
     return max(1, min(fresh_count, cap))
 
 
+def _uploaded_identity(cl: Any, uploaded: Any) -> tuple[str, str]:
+    """Extract (repost_code, repost_pk) from a clip_upload result.
+
+    Defensive for both Media objects and dicts. Never raises.
+    """
+    try:
+        if uploaded is None:
+            return ("", "")
+        pk = ""
+        try:
+            if isinstance(uploaded, dict):
+                pk = str(uploaded.get("pk") or "")
+                if not pk:
+                    raw_id = uploaded.get("id")
+                    if raw_id is not None:
+                        pk = str(raw_id).split("_")[0]
+            else:
+                pk = str(getattr(uploaded, "pk", "") or "")
+                if not pk:
+                    raw_id = getattr(uploaded, "id", None)
+                    if raw_id is not None:
+                        pk = str(raw_id).split("_")[0]
+        except Exception:  # noqa: BLE001
+            pk = ""
+        code = ""
+        try:
+            if isinstance(uploaded, dict):
+                code = str(uploaded.get("code") or "")
+            else:
+                code = str(getattr(uploaded, "code", "") or "")
+        except Exception:  # noqa: BLE001
+            code = ""
+        if not code and pk:
+            try:
+                fn = getattr(cl, "media_code_from_pk", None)
+                if callable(fn):
+                    resolved = fn(pk)
+                    if resolved:
+                        code = str(resolved)
+            except Exception:  # noqa: BLE001
+                pass
+        return (code or "", pk or "")
+    except Exception:  # noqa: BLE001
+        return ("", "")
+
+
 async def run_curation(
     hide_like: bool | None = None,
     thumbnail_override: str | None = None,
     max_attempts: int | None = None,
 ) -> dict[str, Any]:
-    """Fetch candidates once, then retry in random order until one publishes."""
+    """Fetch candidates once, then retry in random order until one publishes.
+
+    Only raises after every attempted candidate failed. Returns summary with
+    attempts, failed_codes, and the published media_code.
+    """
     from app import config, db as dbmod
     from app import ig as igmod
 
+    # Pacing guards run BEFORE any download/upload attempt.
     await _check_pacing()
 
     if hide_like is None:
@@ -147,21 +199,28 @@ async def run_curation(
             caption = _build_caption(caption_text, author)
 
             extra_data = {"like_and_view_counts_disabled": 1} if hide_like else {}
+            # Human-like pause before the write; single attempt per candidate
+            # (writes are NEVER retried blindly — failures move to next).
             await igmod.jitter_delay()
             lock = igmod.get_lock()
             async with lock:
                 if thumb_path is not None:
-                    await cl.clip_upload(
+                    uploaded = await cl.clip_upload(
                         Path(video_path), caption, thumbnail=Path(thumb_path), extra_data=extra_data
                     )
                 else:
-                    await cl.clip_upload(Path(video_path), caption, extra_data=extra_data)
+                    uploaded = await cl.clip_upload(Path(video_path), caption, extra_data=extra_data)
 
             original_url = f"https://www.instagram.com/reel/{code}/"
             await dbmod.insert_processed(code, author, original_url, video_url)
+            repost_code, repost_pk = _uploaded_identity(cl, uploaded)
+            if repost_code or repost_pk:
+                await dbmod.update_repost(code, repost_code, repost_pk)
+                log.info("stored repost identity src=%s repost=%s pk=%s", code, repost_code, repost_pk)
 
             summary = {
                 "media_code": code,
+                "repost_code": repost_code,
                 "author": author,
                 "caption": caption[:300],
                 "hide_like": bool(hide_like),
@@ -175,8 +234,9 @@ async def run_curation(
                 from app import telegramlog as tg
 
                 await tg.send_message(
-                    f"published reel {code} via @{author} "
+                    f"✅ published reel {code} via @{author} "
                     f"(hide_like={bool(hide_like)}, attempts={attempts})"
+                    f" repost={repost_code or '-'}"
                 )
             except Exception:  # noqa: BLE001
                 pass
