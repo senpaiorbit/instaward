@@ -338,7 +338,7 @@ async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSE
     return {"code": code, "pk": pk_str, "archived": True, "method": method}
 
 
-async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
+async def run_archive(time_sec: int, views_thresh: int, job: dict | None = None) -> dict[str, Any]:
     from app import config
     from app import db as dbmod
     from app import ig as igmod
@@ -368,6 +368,11 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
                     log.warning("archive row %s: no repost mapping, skip (source post is not ours)", code)
                     await dbmod.mark_scanned(code, 0)
                     kept += 1
+                    if job is not None:
+                        job["checked"] = checked
+                        job["archived"] = archived
+                        job["kept"] = kept
+                        job["errors"] = list(errors)
                     continue
             pk = target_pk or await _resolve_pk(cl, target_code)
             info: Any = None
@@ -441,6 +446,11 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
                 pass
             errors.append(f"{code}: {type(exc).__name__}: {exc}")
             log.warning("archive row %s failed: %s: %s", code, type(exc).__name__, exc)
+        if job is not None:
+            job["checked"] = checked
+            job["archived"] = archived
+            job["kept"] = kept
+            job["errors"] = list(errors)
 
     summary = {"checked": checked, "archived": archived, "kept": kept, "errors": errors}
     try:
