@@ -176,6 +176,16 @@ async def _archive_media_once(cl: Any, code: str, pk: Any, info: Any) -> str:
                 return "archive:legacy-payload"
         except Exception as exc:  # noqa: BLE001
             log.warning("archive variant legacy-payload(%s) setup failed: %s", code, exc)
+        # 5) media_type query hint (legacy app API sent ?media_type= with only_me).
+        try:
+            data_mt = cl.with_action_data({"media_id": full_id})
+            if await _attempt(
+                "media-type-hint",
+                lambda: cl.private_request(f"media/{full_id}/only_me/", data_mt, params={"media_type": "2"}),
+            ):
+                return "archive:media-type-hint"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("archive variant media-type-hint(%s) setup failed: %s", code, exc)
         log.warning("all archive variants failed for %s, local-only mark", code)
         return "local"
 
