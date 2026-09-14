@@ -72,8 +72,10 @@ async def _resolve_pk(cl: Any, code: str) -> Any | None:
                     res = await res
                 if res:
                     return res
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                log.warning("_resolve_pk(%s) via %s failed: %s: %s", code, name, type(exc).__name__, exc)
                 continue
+    log.warning("_resolve_pk(%s) returned no pk", code)
     return None
 
 
@@ -136,6 +138,11 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
                 and views <= views_thresh
             ):
                 should_archive = True
+            log.info(
+                "archive row %s: pk=%s views=%s taken_at=%s age_sec=%s time_sec=%s views_thresh=%s -> %s",
+                code, pk, views, taken_at, round(age_sec, 1), time_sec, views_thresh,
+                "ARCHIVE" if should_archive else "keep",
+            )
 
             if should_archive and pk is not None:
                 user_id = getattr(getattr(info, "user", None), "pk", None) or getattr(
