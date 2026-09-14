@@ -253,7 +253,17 @@ Identical CTAs on every post can look spammy — rotate 3+ variants.
 - **GitHub MCP**: push this workspace, open PRs, wire Render auto-deploys.
 - **Turso MCP**: create DB, copy `TURSO_URL` + token, run `schema.sql`
   (app also runs it via `init_db` on startup; `repost_code`/`repost_pk`
-  backfilled by `ALTER TABLE` on boot).
+  backfilled by `ALTER TABLE` on boot, verified via `PRAGMA` with a
+  `schema verify ok/FAILED` log line).
+
+## Applying schema changes (Turso dashboard)
+
+The dashboard SQL editor runs **one statement at a time** — pasting the whole
+`schema.sql` fails. For upgrades, run `migrate.sql` statement-by-statement
+(first `ALTER TABLE … repost_code`, then `… repost_pk`); a
+`duplicate column name` error just means that column already exists. Fresh
+installs: run each `CREATE TABLE` in `schema.sql` separately, or simply boot
+the app — `init_db` creates + migrates + verifies on every start.
 
 ## Thumbnail URL usage
 
