@@ -1,5 +1,14 @@
 # instaward-bot — personal Instagram curation & retirement bot
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/senpaiorbit/instaward)
+
+> One-click deploy via the Blueprint (`render.yaml`): secrets stay empty for
+> you to fill in the dashboard, everything else is pre-set to working defaults.
+> **Convention:** any *optional* variable set to `0` (or `none`) counts as
+> empty/disabled — e.g. `LOG_LEVEL=0` silences all logging, `THUMBNAIL_URL=0`
+> means no global cover. Only `ENV_KEY`, `TURSO_URL`, `TURSO_AUTH_TOKEN`,
+> `INSTAGRAM_USERNAME` + `INSTAGRAM_PASSWORD` are truly required.
+
 > **Personal-use only.** This bot reposts content you curate to **your own**
 > archive/curation account. It performs **no auto-follow, no auto-like, no DM**.
 > It does post a CTA comment (default off) **only on its own uploads**, and
@@ -162,7 +171,7 @@ tkhd`) covers it — no extra deps.
 | `QUALITY_MIN_HEIGHT` | no | `960` | Min video height px |
 | `QUALITY_STRICT` | no | `0` | `1` = reject when resolution can't be determined; `0` = allow with warning |
 | `COMMENT_ENABLED` | no | `0` | Master switch for auto-comments (off by default; `&comment=1` per call) |
-| `COMMENT_TEXT` | no | `FOLLOW ME / FOLLOW FOR MORE / FOLLOW ME` | `\|`-separated rotation, random pick per post (fire emoji variants) |
+| `COMMENT_TEXT` | no | variants | `\|`-separated rotation, random pick per post (fire-emoji FOLLOW ME set) |
 | `SESSION_REUSE_TTL_MIN` | no | `120` | In-process authenticated-client reuse TTL |
 | `IG_CALL_JITTER_SEC` | no | `1,3` | `min,max` human-like jitter before writes / between reads |
 | `HIDELIKE` | no | `1` | `extra_data={"like_and_view_counts_disabled":1}`. Alias: `HIDE_LIKE_VIEW_COUNTS` |
@@ -175,7 +184,7 @@ tkhd`) covers it — no extra deps.
 | `MIN_POST_INTERVAL_MIN` | no | `30` | Pacing floor (slept inside jobs, same candidate retried) |
 | `MAX_PER_DAY` | no | `10` | Daily cap (fails the run when hit) |
 | `MAX_UPLOADS_PER_RUN` | no | `=MAX_PER_DAY` | Legacy per-run cap, clamped to `MAX_PER_DAY` |
-| `LOG_LEVEL` | no | `INFO` | Logger level |
+| `LOG_LEVEL` | no | `INFO` | Logger level; `0`/`none`/`off` disables all logging |
 | `PORT` | no | `8000` | Runtime port |
 | `PYTHON_VERSION` | render | `3.12.7` | Pinned runtime |
 
