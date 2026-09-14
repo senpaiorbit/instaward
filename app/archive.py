@@ -119,6 +119,95 @@ async def _resolve_pk(cl: Any, code: str) -> Any | None:
     return None
 
 
+_UNSET: Any = object()
+
+
+async def _archive_media_once(cl: Any, code: str, pk: Any, info: Any) -> str:
+    """Shared single-attempt archive/delete/local chain.
+
+    Runs media_archive(f"{pk}_{user_id}") once; on failure falls back to
+    media_delete(pk) once, then local-only mark. Returns
+    "archive" | "delete" | "local". Auth errors mark the session stale
+    and re-raise for the caller to handle.
+    """
+    from app import ig as igmod
+
+    user_id = getattr(getattr(info, "user", None), "pk", None) or getattr(
+        getattr(info, "user", None), "id", ""
+    )
+    media_id = f"{pk}_{user_id}" if user_id else pk
+    # Single attempt per write (never retried blindly); failures
+    # fall back to delete once, then local-only mark.
+    await igmod.jitter_delay()
+    lock = igmod.get_lock()
+    async with lock:
+        try:
+            await cl.media_archive(media_id)
+            log.info("archived %s via media_archive", code)
+            return "archive"
+        except Exception as arch_exc:  # noqa: BLE001
+            if igmod.is_auth_error(arch_exc):
+                igmod.mark_session_stale()
+                raise
+            log.warning("media_archive(%s) failed, trying delete: %s", code, arch_exc)
+            try:
+                await cl.media_delete(pk)
+                log.info("archived %s via media_delete fallback", code)
+                return "delete"
+            except Exception as del_exc:  # noqa: BLE001
+                if igmod.is_auth_error(del_exc):
+                    igmod.mark_session_stale()
+                    raise
+                log.warning("media_delete(%s) failed, local-only mark: %s", code, del_exc)
+                return "local"
+
+
+async def archive_single(cl: Any, code: str, pk: Any = _UNSET, info: Any = _UNSET) -> dict[str, Any]:
+    """Archive ONE specific shortcode, bypassing DB age/views gating.
+
+    Unless pk/info are explicitly passed (run_archive's per-row path),
+    resolves pk via _resolve_pk and confirms existence via media_info with
+    read_with_backoff. Then runs the shared single-attempt archive/delete/
+    local chain and marks the row archived in DB. Touches only the requested
+    code.
+    """
+    from app import db as dbmod
+    from app import ig as igmod
+
+    log.info("archive_single start code=%s", code)
+    if pk is _UNSET:
+        pk = await _resolve_pk(cl, code)
+    log.info("archive_single %s resolved pk=%s", code, pk)
+    if pk is None:
+        log.warning("archive_single %s: no pk, local-only mark", code)
+        await dbmod.mark_archived(code, 1)
+        log.info("archive_single %s done method=local (unresolved pk)", code)
+        return {"code": code, "pk": None, "archived": True, "method": "local", "reason": "unresolved-pk"}
+    if info is _UNSET:
+        lock = igmod.get_lock()
+        async with lock:
+            try:
+                info = await igmod.read_with_backoff("media_info", cl.media_info, pk)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("media_info(%s) failed: %s: %s", code, type(exc).__name__, exc)
+                if igmod.is_auth_error(exc):
+                    raise
+                raise
+        if info is None:
+            raise RuntimeError(f"media_info({code}) returned no media")
+        log.info("archive_single %s exists pk=%s, archiving", code, pk)
+    else:
+        log.info("archive_single %s using provided pk=%s info", code, pk)
+    method = await _archive_media_once(cl, code, pk, info)
+    await dbmod.mark_archived(code, 1)
+    log.info("archive_single %s done method=%s", code, method)
+    try:
+        pk_str: Any = str(pk)
+    except Exception:  # noqa: BLE001
+        pk_str = None
+    return {"code": code, "pk": pk_str, "archived": True, "method": method}
+
+
 async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
     from app import config
     from app import db as dbmod
@@ -200,34 +289,9 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
                 "ARCHIVE" if should_archive else "keep",
             )
 
-            if should_archive and pk is not None:
-                user_id = getattr(getattr(info, "user", None), "pk", None) or getattr(
-                    getattr(info, "user", None), "id", ""
-                )
-                media_id = f"{pk}_{user_id}" if user_id else pk
-                # Single attempt per write (never retried blindly); failures
-                # fall back to delete once, then local-only mark.
-                await igmod.jitter_delay()
-                async with lock:
-                    try:
-                        await cl.media_archive(media_id)
-                    except Exception as arch_exc:  # noqa: BLE001
-                        if igmod.is_auth_error(arch_exc):
-                            igmod.mark_session_stale()
-                            raise
-                        log.warning("media_archive(%s) failed, trying delete: %s", code, arch_exc)
-                        try:
-                            await cl.media_delete(pk)
-                        except Exception as del_exc:  # noqa: BLE001
-                            if igmod.is_auth_error(del_exc):
-                                igmod.mark_session_stale()
-                                raise
-                            log.warning("media_delete(%s) failed, local-only mark: %s", code, del_exc)
-                await dbmod.mark_archived(code, 1)
-                archived += 1
-            elif should_archive and pk is None:
-                # Cannot call API without pk -> local-only mark as archived
-                await dbmod.mark_archived(code, 1)
+            if should_archive:
+                result = await archive_single(cl, code, pk=pk, info=info)
+                log.info("archive row %s archived via %s", code, result.get("method"))
                 archived += 1
             else:
                 await dbmod.mark_scanned(code, 0)
