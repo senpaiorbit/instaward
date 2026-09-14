@@ -1,10 +1,12 @@
-"""Archive job: archive stale/low-view reposts via real media_archive.
+"""Archive job: retire stale/low-view reposts (ours only).
 
 Policy:
 - Only DB-tracked rows (processed_media WHERE archived=0 AND archive_scanned=0).
-- For each: media_info + insights for age/views.
-- If age > threshold AND views <= threshold -> media_archive(f"{pk}_{user_id}").
-- Fallback to local-only mark if archive fails; NEVER delete.
+- For each: resolve OUR repost (repost_code/pk, else own-feed backfill); never
+  touch the source post or any media owned by another account.
+- If age > threshold AND views <= threshold -> retire own repost:
+  photos via media_archive, clips via media_delete (IG API cannot archive clips).
+- Fallback to local-only mark if retirement fails; NEVER delete others' media.
 - Always set archive_scanned=1 so we never hard-scan everything.
 """
 import logging
@@ -116,7 +118,13 @@ _UNSET: Any = object()
 
 
 async def _archive_media_once(cl: Any, code: str, pk: Any, info: Any) -> str:
-    """Try archive variants in order; fallback is local-only mark. No delete."""
+    """Retire our own repost; fallback is local-only mark.
+
+    Photos -> media_archive variants. Clips -> media_delete (IG API responds
+    "cannot archive Clips media" to every archive variant). Deletion runs ONLY
+    when the media owner is our own logged-in account; anything else (or
+    unresolvable ownership) -> local-only, never touching others' media.
+    """
     from app import ig as igmod
 
     pk_str = str(pk)
@@ -126,9 +134,10 @@ async def _archive_media_once(cl: Any, code: str, pk: Any, info: Any) -> str:
     owner = str(owner or "").strip()
     self_uid = str(getattr(cl, "user_id", "") or "")
     full_id = f"{pk_str}_{owner}" if owner else pk_str
+    owned = bool(owner and self_uid and owner == self_uid)
     log.info(
-        "archive try %s pk=%s owner=%s self=%s full=%s",
-        code, pk_str, owner, self_uid, full_id,
+        "archive try %s pk=%s owner=%s self=%s owned=%s full=%s",
+        code, pk_str, owner, self_uid, owned, full_id,
     )
     await igmod.jitter_delay()
     lock = igmod.get_lock()
@@ -150,6 +159,18 @@ async def _archive_media_once(cl: Any, code: str, pk: Any, info: Any) -> str:
             return False
 
     async with lock:
+        if not owned:
+            log.warning(
+                "retire skip %s: not ours (owner=%s self=%s), local-only mark",
+                code, owner, self_uid,
+            )
+            return "local"
+        if _is_clip_media(info):
+            if await _attempt("delete-own-clip", lambda: cl.media_delete(pk_str)):
+                log.info("deleted own clip %s via media_delete", code)
+                return "delete"
+            log.warning("delete(%s) failed, local-only mark", code)
+            return "local"
         # 1) pk-only: lets aiograpi resolve the true owner via media_user().
         if await _attempt("pk-only", lambda: cl.media_archive(pk_str)):
             return "archive:pk-only"
