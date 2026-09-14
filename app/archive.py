@@ -5,7 +5,7 @@ Policy (also in README):
 - For each: media_info + insights for age/views.
 - Age is measured from OUR repost time (DB published_at), not the original
   reel's taken_at, so a fresh repost of an old reel is kept.
-- If age > threshold OR views <= threshold -> media_archive(f"{pk}_{user_id}").
+- If age > threshold AND views <= threshold -> media_archive(f"{pk}_{user_id}").
 - Fallback to media_delete only if archive raises; else local-only mark.
 - Always set archive_scanned=1 so we never hard-scan everything.
 """
@@ -126,9 +126,15 @@ async def run_archive(time_sec: int, views_thresh: int) -> dict[str, Any]:
             age_sec = (now - taken_at).total_seconds() if taken_at else 0
 
             should_archive = False
-            if taken_at and age_sec > time_sec:
-                should_archive = True
-            if views is not None and views <= views_thresh:
+            # AND semantics: archive only when the repost is old enough AND
+            # its views are at/below the threshold. Fresh posts are kept even
+            # with 0 views; unknown views never trigger archiving.
+            if (
+                taken_at
+                and age_sec > time_sec
+                and views is not None
+                and views <= views_thresh
+            ):
                 should_archive = True
 
             if should_archive and pk is not None:
