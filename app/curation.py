@@ -287,8 +287,12 @@ async def run_curation(
             await dbmod.insert_processed(code, author, original_url, video_url)
             repost_code, repost_pk = _uploaded_identity(cl, uploaded)
             if repost_code or repost_pk:
-                await dbmod.update_repost(code, repost_code, repost_pk)
-                log.info("stored repost identity src=%s repost=%s pk=%s", code, repost_code, repost_pk)
+                try:
+                    await dbmod.update_repost(code, repost_code, repost_pk)
+                except Exception as exc_map:  # noqa: BLE001 - bookkeeping must not fail the publish
+                    log.warning("repost map save failed src=%s: %s (publish counts)", code, exc_map)
+                else:
+                    log.info("stored repost identity src=%s repost=%s pk=%s", code, repost_code, repost_pk)
 
             comment_posted = False
             comment_pinned = False
