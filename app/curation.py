@@ -228,6 +228,41 @@ async def run_curation(
             )
             thumb_path = await igmod.cache_thumbnail(thumb_url or None, code)
 
+            from app import quality as qualitymod
+
+            if int(getattr(config, "QUALITY_ENABLED", 1) or 0):
+                try:
+                    qmin_b = int(getattr(config, "QUALITY_MIN_BYTES", 300000) or 0)
+                except (TypeError, ValueError):
+                    qmin_b = 300000
+                try:
+                    qmin_w = int(getattr(config, "QUALITY_MIN_WIDTH", 720) or 0)
+                except (TypeError, ValueError):
+                    qmin_w = 720
+                try:
+                    qmin_h = int(getattr(config, "QUALITY_MIN_HEIGHT", 960) or 0)
+                except (TypeError, ValueError):
+                    qmin_h = 960
+                try:
+                    qstrict = int(getattr(config, "QUALITY_STRICT", 0) or 0)
+                except (TypeError, ValueError):
+                    qstrict = 0
+                ok, reason, res = qualitymod.check_video(video_path, qmin_b, qmin_w, qmin_h, qstrict)
+                if res is None and not qstrict:
+                    try:
+                        tok, treason = qualitymod.check_thumbnail(thumb_path, qmin_w, qmin_h)
+                        log.info(
+                            "thumb proxy src=%s ok=%s %s",
+                            code,
+                            tok,
+                            treason or f"{qmin_w}x{qmin_h}",
+                        )
+                    except Exception:  # noqa: BLE001 - proxy is logging-only
+                        pass
+                if not ok:
+                    raise RuntimeError(f"quality reject: {reason}")
+                log.info("quality ok src=%s %s", code, res or "unprobed")
+
             caption = _build_caption(caption_text, author)
 
             extra_data = {"like_and_view_counts_disabled": 1} if hide_like else {}
@@ -250,6 +285,88 @@ async def run_curation(
                 await dbmod.update_repost(code, repost_code, repost_pk)
                 log.info("stored repost identity src=%s repost=%s pk=%s", code, repost_code, repost_pk)
 
+            comment_posted = False
+            comment_pinned = False
+            comment_text = ""
+            if not (repost_code or repost_pk):
+                log.info("comment skipped src=%s (no repost identity)", code)
+            elif int(getattr(config, "COMMENT_ENABLED", 1) or 0) and str(
+                getattr(config, "COMMENT_TEXT", "") or ""
+            ).strip():
+                try:
+                    variants = [
+                        v.strip()
+                        for v in str(getattr(config, "COMMENT_TEXT", "") or "").split("|")
+                    ]
+                    variants = [v for v in variants if v]
+                    text = random.choice(variants).strip() if variants else ""
+                except Exception:  # noqa: BLE001
+                    text = ""
+                if not text:
+                    log.info("comment skipped src=%s (empty text)", code)
+                else:
+                    comment_text = text
+                    try:
+                        await igmod.jitter_delay()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        uid = str(getattr(cl, "user_id", "") or "").strip()
+                    except Exception:  # noqa: BLE001
+                        uid = ""
+                    full_id = f"{repost_pk}_{uid}" if (repost_pk and uid) else str(repost_pk or "")
+                    if not full_id:
+                        log.info("comment skipped src=%s (no media id)", code)
+                    else:
+                        lock = igmod.get_lock()
+                        res_comment: Any = None
+                        async with lock:
+                            try:
+                                res_comment = await cl.media_comment(full_id, text)
+                                comment_posted = True
+                            except Exception as exc1:  # noqa: BLE001
+                                log.warning("comment attempt1 failed src=%s: %s", code, exc1)
+                                res_comment = None
+                                if str(repost_pk or "") and str(repost_pk) != full_id:
+                                    try:
+                                        res_comment = await cl.media_comment(
+                                            str(repost_pk), text
+                                        )
+                                        comment_posted = True
+                                    except Exception as exc2:  # noqa: BLE001
+                                        log.warning(
+                                            "comment attempt2 failed src=%s: %s", code, exc2
+                                        )
+                                        res_comment = None
+                                if res_comment is None:
+                                    log.warning("comment unposted src=%s (publish counts)", code)
+                        if comment_posted:
+                            comment_pk: Any = None
+                            try:
+                                rc = res_comment
+                                if isinstance(rc, dict):
+                                    comment_pk = rc.get("pk", "") or rc.get("id", "")
+                                    if not comment_pk:
+                                        nested = rc.get("comment")
+                                        if isinstance(nested, dict):
+                                            comment_pk = nested.get("pk", "") or nested.get(
+                                                "id", ""
+                                            )
+                                else:
+                                    comment_pk = getattr(rc, "pk", "") or getattr(rc, "id", "")
+                            except Exception:  # noqa: BLE001
+                                comment_pk = None
+                            if comment_pk:
+                                try:
+                                    async with lock:
+                                        await cl.comment_pin(full_id, int(str(comment_pk).strip()))
+                                    comment_pinned = True
+                                    log.info("comment pinned src=%s pk=%s", code, comment_pk)
+                                except Exception as excp:  # noqa: BLE001
+                                    log.warning("comment pin failed src=%s: %s", code, excp)
+                            else:
+                                log.info("comment posted (no pk to pin) src=%s", code)
+
             published.append({"media_code": code, "repost_code": repost_code, "author": author})
             if not first:
                 first = {
@@ -259,6 +376,11 @@ async def run_curation(
                     "caption": caption[:300],
                     "video_path": str(video_path),
                     "thumbnail_path": str(thumb_path) if thumb_path else None,
+                    "comment": {
+                        "posted": bool(comment_posted),
+                        "pinned": bool(comment_pinned),
+                        "text": comment_text,
+                    },
                 }
             _sync_job()
             if len(published) >= want:
@@ -292,15 +414,19 @@ async def run_curation(
         "failed_count": len(failed_codes),
         "published": published,
         "published_count": len(published),
+        "comment": dict(first.get("comment", {"posted": False, "pinned": False, "text": ""})),
     }
     try:
         from app import telegramlog as tg
 
         suffix = f" (+{len(published) - 1} more)" if len(published) > 1 else ""
+        _c = summary.get("comment", {})
+        _cstate = "pinned" if _c.get("pinned") else ("posted" if _c.get("posted") else "skipped")
         await tg.send_message(
             f"✅ published reel {first['media_code']} via @{first['author']} "
             f"(hide_like={bool(hide_like)}, attempts={attempts})"
             f" repost={first['repost_code'] or '-'}{suffix}"
+            f" comment={_cstate}"
         )
     except Exception:  # noqa: BLE001
         pass
