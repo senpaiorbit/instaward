@@ -1,5 +1,6 @@
 """FastAPI entrypoint. Import-safe: scheduler starts in lifespan, no IG at import."""
 # archive_one bypass endpoint added 2026-09-14
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -109,6 +110,7 @@ async def archive(
     key: str = Query(""),
     time: str | None = Query(None),
     views: int | None = Query(None),
+    wait: int | None = Query(None),
 ) -> dict:
     _check_key(key)
     from app import telegramlog as tg
@@ -119,12 +121,49 @@ async def archive(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     views_thresh = config.ARCHIVE_VIEWS if views is None else views
-    try:
-        summary = await run_archive(time_sec, views_thresh)
-        return {"ok": True, "time_sec": time_sec, "views": views_thresh, "summary": summary}
-    except Exception as exc:  # noqa: BLE001
-        await tg.notify_error("archive", exc)
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+    if wait:
+        try:
+            summary = await run_archive(time_sec, views_thresh)
+            return {"ok": True, "time_sec": time_sec, "views": views_thresh, "summary": summary}
+        except Exception as exc:  # noqa: BLE001
+            await tg.notify_error("archive", exc)
+            raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+    from app import jobs as jobsmod
+
+    existing = jobsmod.current_running("archive")
+    jobsmod.prune()
+    if existing:
+        return {
+            "ok": True,
+            "job_id": existing["id"],
+            "status": "running",
+            "time_sec": time_sec,
+            "views": views_thresh,
+            "note": "already running",
+        }
+    job = jobsmod.create_job("archive", {"time_sec": time_sec, "views": views_thresh})
+    asyncio.create_task(jobsmod.run_archive_job(job["id"], time_sec, views_thresh))
+    return {
+        "ok": True,
+        "job_id": job["id"],
+        "status": "running",
+        "time_sec": time_sec,
+        "views": views_thresh,
+    }
+
+
+@app.get("/a_job")
+async def a_job(
+    key: str = Query(""),
+    id: str = Query(""),
+) -> dict:
+    _check_key(key)
+    from app import jobs as jobsmod
+
+    job = jobsmod.get_job((id or "").strip())
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"ok": True, "job": job}
 
 
 @app.get("/archive_one")
