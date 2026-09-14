@@ -11,13 +11,6 @@ log = logging.getLogger("instaward-bot")
 logging.basicConfig(level=logging.INFO)
 log.addHandler(TelegramLogHandler())
 
-try:
-    from app.ig_sessionid import install_sessionid_first
-
-    install_sessionid_first()
-except Exception as exc:  # noqa: BLE001 - sessionid patch is optional
-    log.warning("sessionid patch not installed: %s", exc)
-
 
 def _check_key(key: str) -> None:
     if not config.ENV_KEY or key != config.ENV_KEY:
@@ -130,4 +123,34 @@ async def archive(
         return {"ok": True, "summary": summary}
     except Exception as exc:  # noqa: BLE001
         await tg.notify_error("archive", exc)
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+
+
+@app.get("/archive_one")
+async def archive_one(
+    key: str = Query(""),
+    code: str = Query(""),
+) -> dict:
+    """Archive a single shortcode immediately, bypassing DB age/views gating.
+
+    Used for posts that were uploaded manually (not tracked in processed_media)
+    or that need one-off archival regardless of age/views policy.
+    """
+    _check_key(key)
+    from app import ig as igmod
+    from app import telegramlog as tg
+    from app.archive import archive_single
+
+    shortcode = (code or "").strip()
+    if not shortcode:
+        raise HTTPException(status_code=400, detail="code is required")
+    try:
+        log.info("archive_one request code=%s", shortcode)
+        cl = await igmod.ensure_login()
+        summary = await archive_single(cl, shortcode)
+        return {"ok": True, "summary": summary}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await tg.notify_error("archive_one", exc)
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
