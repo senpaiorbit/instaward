@@ -1,4 +1,5 @@
-"""Curation: retry over candidates until one reel publishes. Import-safe."""
+"""Curation: retry over candidates until target publishes. Import-safe."""
+import asyncio
 import logging
 import os
 import random
@@ -10,9 +11,10 @@ log = logging.getLogger("instaward-bot")
 
 
 class RateLimited(Exception):
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, kind: str = "daily") -> None:
         super().__init__(detail)
         self.detail = detail
+        self.kind = kind
 
 
 async def _check_pacing() -> None:
@@ -29,7 +31,8 @@ async def _check_pacing() -> None:
             if age_min < config.MIN_POST_INTERVAL_MIN:
                 raise RateLimited(
                     f"pacing: last post {age_min:.1f}min ago, minimum is "
-                    f"{config.MIN_POST_INTERVAL_MIN}min"
+                    f"{config.MIN_POST_INTERVAL_MIN}min",
+                    kind="interval",
                 )
         except RateLimited:
             raise
@@ -37,7 +40,7 @@ async def _check_pacing() -> None:
             pass
     today_count = await dbmod.count_today()
     if today_count >= config.MAX_PER_DAY:
-        raise RateLimited(f"pacing: {today_count} posts today, max is {config.MAX_PER_DAY}")
+        raise RateLimited(f"pacing: {today_count} posts today, max is {config.MAX_PER_DAY}", kind="daily")
 
 
 def _cleanup_tmp(*paths: Optional[Path]) -> None:
@@ -135,20 +138,36 @@ async def run_curation(
     hide_like: bool | None = None,
     thumbnail_override: str | None = None,
     max_attempts: int | None = None,
+    target_count: int = 1,
+    job: dict | None = None,
 ) -> dict[str, Any]:
-    """Fetch candidates once, then retry in random order until one publishes.
+    """Fetch candidates once, then retry in random order until target publishes.
 
     Only raises after every attempted candidate failed. Returns summary with
-    attempts, failed_codes, and the published media_code.
+    attempts, failed_codes, and the published media_code(s).
     """
     from app import config, db as dbmod
     from app import ig as igmod
 
-    # Pacing guards run BEFORE any download/upload attempt.
-    await _check_pacing()
+    def _sync_job() -> None:
+        if job is None:
+            return
+        try:
+            job["attempted"] = attempts
+            job["published"] = len(published)
+            job["failed"] = len(failed_codes)
+            job["items"] = list(published)
+            job["errors"] = [f["error"] for f in failed_codes][-10:]
+        except Exception:  # noqa: BLE001
+            pass
 
     if hide_like is None:
         hide_like = bool(config.HIDELIKE)
+
+    try:
+        want = max(1, int(target_count or 1))
+    except (TypeError, ValueError):
+        want = 1
 
     fetch_n = getattr(config, "FETCH_COUNT", 30) or 30
     cl = await igmod.ensure_login()
@@ -170,11 +189,24 @@ async def run_curation(
         except (TypeError, ValueError):
             raise ValueError("max_attempts must be an integer")
         limit = max(1, min(limit, len(fresh)))
+    limit = max(limit, min(len(fresh), want * 5))
 
     attempts = 0
     failed_codes: list[dict[str, str]] = []
+    published: list[dict[str, str]] = []
+    first: dict[str, Any] = {}
 
     for media in fresh[:limit]:
+        # Pacing gate: interval waits retry the SAME candidate without
+        # counting an attempt or recording a failure; daily cap fails the run.
+        while True:
+            try:
+                await _check_pacing()
+                break
+            except RateLimited as rl:
+                if rl.kind == "daily":
+                    raise
+                await asyncio.sleep(60)
         code = str(getattr(media, "code", getattr(media, "pk", "")))
         attempts += 1
         video_path: Optional[Path] = None
@@ -218,29 +250,20 @@ async def run_curation(
                 await dbmod.update_repost(code, repost_code, repost_pk)
                 log.info("stored repost identity src=%s repost=%s pk=%s", code, repost_code, repost_pk)
 
-            summary = {
-                "media_code": code,
-                "repost_code": repost_code,
-                "author": author,
-                "caption": caption[:300],
-                "hide_like": bool(hide_like),
-                "video_path": str(video_path),
-                "thumbnail_path": str(thumb_path) if thumb_path else None,
-                "attempts": attempts,
-                "failed_codes": failed_codes,
-                "failed_count": len(failed_codes),
-            }
-            try:
-                from app import telegramlog as tg
-
-                await tg.send_message(
-                    f"✅ published reel {code} via @{author} "
-                    f"(hide_like={bool(hide_like)}, attempts={attempts})"
-                    f" repost={repost_code or '-'}"
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return summary
+            published.append({"media_code": code, "repost_code": repost_code, "author": author})
+            if not first:
+                first = {
+                    "media_code": code,
+                    "repost_code": repost_code,
+                    "author": author,
+                    "caption": caption[:300],
+                    "video_path": str(video_path),
+                    "thumbnail_path": str(thumb_path) if thumb_path else None,
+                }
+            _sync_job()
+            if len(published) >= want:
+                break
+            continue
         except Exception as exc:  # noqa: BLE001 - per-candidate failure: continue
             log.warning("candidate %s failed (%d/%d): %s: %s", code, attempts, limit, type(exc).__name__, exc)
             try:
@@ -250,6 +273,35 @@ async def run_curation(
                 pass
             failed_codes.append({"code": code, "error": f"{type(exc).__name__}: {exc}"})
             _cleanup_tmp(video_path, thumb_path)
+            _sync_job()
             continue
 
-    raise RuntimeError(f"all {attempts} candidates failed: {[f['code'] for f in failed_codes]}")
+    if not published:
+        raise RuntimeError(f"all {attempts} candidates failed: {[f['code'] for f in failed_codes]}")
+
+    summary = {
+        "media_code": first["media_code"],
+        "repost_code": first["repost_code"],
+        "author": first["author"],
+        "caption": first["caption"],
+        "hide_like": bool(hide_like),
+        "video_path": first["video_path"],
+        "thumbnail_path": first["thumbnail_path"],
+        "attempts": attempts,
+        "failed_codes": failed_codes,
+        "failed_count": len(failed_codes),
+        "published": published,
+        "published_count": len(published),
+    }
+    try:
+        from app import telegramlog as tg
+
+        suffix = f" (+{len(published) - 1} more)" if len(published) > 1 else ""
+        await tg.send_message(
+            f"✅ published reel {first['media_code']} via @{first['author']} "
+            f"(hide_like={bool(hide_like)}, attempts={attempts})"
+            f" repost={first['repost_code'] or '-'}{suffix}"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return summary
