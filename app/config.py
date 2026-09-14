@@ -28,6 +28,26 @@ def _get_first(*names: str, default: str = "") -> str:
     return default
 
 
+# Tokens that mean "not provided / disabled" for optional string settings.
+# Lets users write VAR=0 instead of leaving a value unset.
+_NONE_TOKENS = frozenset({"0", "none", "null", "nil", "-", "n/a", "na"})
+
+
+def _is_none_token(raw: str) -> bool:
+    try:
+        return str(raw or "").strip().lower() in _NONE_TOKENS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _get_opt(name: str, default: str = "") -> str:
+    """Like _get, but 0/none/null also resolve to the default (unset)."""
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "" or _is_none_token(v):
+        return default
+    return v
+
+
 def parse_duration_to_seconds(raw: str, default_seconds: int = 24 * 3600) -> int:
     """Parse '12h', '90m', '2d', '3600', '3600s' -> seconds."""
     if raw is None or str(raw).strip() == "":
@@ -107,12 +127,12 @@ TURSO_AUTH_TOKEN: str = _get("TURSO_AUTH_TOKEN", "")
 # --- Instagram login ---
 INSTAGRAM_USERNAME: str = _get("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD: str = _get("INSTAGRAM_PASSWORD", "")
-INSTAGRAM_SESSION_STATE: str = _get("INSTAGRAM_SESSION_STATE", "")
+INSTAGRAM_SESSION_STATE: str = _get_opt("INSTAGRAM_SESSION_STATE", "")
 
 
 def _clean_session_cookie(raw: str) -> str:
     """URL-decode a raw cookie value; strip whitespace/quotes. No logging."""
-    if not raw:
+    if not raw or _is_none_token(raw):
         return ""
     from urllib.parse import unquote
 
@@ -154,8 +174,8 @@ def _clean_secret(raw: str) -> str:
 INSTAGRAM_TOTP_SEED: str = _clean_secret(_get("INSTAGRAM_TOTP_SEED", "")).replace(" ", "")
 INSTAGRAM_2FA_CODE: str = _clean_secret(_get("INSTAGRAM_2FA_CODE", ""))
 
-TELEGRAM_BOT_TOKEN: str = _get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID: str = _get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN: str = _get_opt("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = _get_opt("TELEGRAM_CHAT_ID", "")
 
 ARCHIVE_TIME_RAW: str = _get("ARCHIVE_TIME", "24h")
 ARCHIVE_TIME_SEC: int = parse_duration_to_seconds(ARCHIVE_TIME_RAW, 24 * 3600)
@@ -172,7 +192,7 @@ QUALITY_STRICT: int = _parse_int("QUALITY_STRICT", 0)
 
 # --- Auto-comment on own just-published repost (off by default; &comment=1) ---
 COMMENT_ENABLED: int = _parse_int("COMMENT_ENABLED", 0)
-COMMENT_TEXT: str = _get("COMMENT_TEXT", "FOLLOW ME \U0001F525|FOLLOW FOR MORE \U0001F525|FOLLOW ME ❤️")
+COMMENT_TEXT: str = _get_opt("COMMENT_TEXT", "FOLLOW ME 🔥|FOLLOW FOR MORE 🔥|FOLLOW ME ❤️")
 
 # In-process authenticated-client reuse (biggest IG-call saver on free plan).
 SESSION_REUSE_TTL_MIN: int = _parse_int("SESSION_REUSE_TTL_MIN", 120)
@@ -199,9 +219,9 @@ BOTLOG: int = _parse_int("BOTLOG", 1)
 COVER_MODE: str = _get("COVER_MODE", "static").strip().lower() or "static"
 if COVER_MODE not in ("random", "static"):
     COVER_MODE = "static"
-COVER_DIR: str = _get("COVER_DIR", "")
-COVER_FILE: str = _get("COVER_FILE", "")
-_THUMB_CANONICAL: str = _get("THUMBNAIL_URL", "")
+COVER_DIR: str = _get_opt("COVER_DIR", "")
+COVER_FILE: str = _get_opt("COVER_FILE", "")
+_THUMB_CANONICAL: str = _get_opt("THUMBNAIL_URL", "")
 if _THUMB_CANONICAL:
     THUMBNAIL_URL: str = _THUMB_CANONICAL
 elif COVER_FILE:
@@ -228,9 +248,17 @@ else:
     MAX_UPLOADS_PER_RUN = MAX_PER_DAY
 
 # --- Logging ---
+# LOG_LEVEL=0 (or none/off) disables all logging.
 LOG_LEVEL: str = _get_first("LOG_LEVEL", default="INFO").strip().upper() or "INFO"
-try:
-    _level = getattr(logging, LOG_LEVEL, logging.INFO)
-    logging.getLogger("instaward-bot").setLevel(_level)
-except Exception:  # noqa: BLE001 - never fail import on bad level
-    pass
+if LOG_LEVEL in ("0", "NONE", "OFF", "DISABLE", "DISABLED"):
+    LOG_LEVEL = "DISABLED"
+    try:
+        logging.disable(logging.CRITICAL)
+    except Exception:  # noqa: BLE001 - never fail import on bad level
+        pass
+else:
+    try:
+        _level = getattr(logging, LOG_LEVEL, logging.INFO)
+        logging.getLogger("instaward-bot").setLevel(_level)
+    except Exception:  # noqa: BLE001 - never fail import on bad level
+        pass

@@ -6,6 +6,7 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      # --- Required: secrets (fill in dashboard; sync:false keeps them out of git) ---
       - key: PYTHON_VERSION
         value: 3.12.7
       - key: TURSO_URL
@@ -16,21 +17,65 @@ services:
         sync: false
       - key: INSTAGRAM_PASSWORD
         sync: false
+      - key: ENV_KEY
+        sync: false
+      # --- Optional secrets (leave empty / set 0 to skip) ---
       - key: INSTAGRAM_SESSION_STATE
+        sync: false
+      - key: INSTAGRAM_SESSIONID
+        sync: false
+      - key: INSTAGRAM_CSRFTOKEN
+        sync: false
+      - key: INSTAGRAM_DS_USER_ID
+        sync: false
+      - key: INSTAGRAM_TOTP_SEED
+        sync: false
+      - key: INSTAGRAM_2FA_CODE
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: ENV_KEY
+      - key: THUMBNAIL_URL
         sync: false
+      - key: COVER_FILE
+        sync: false
+      - key: COVER_DIR
+        sync: false
+      # --- Pre-set defaults: deploy works without touching these ---
       - key: ARCHIVE_TIME
-        value: 12h
+        value: 24h
       - key: ARCHIVE_VIEWS
         value: 1000
+      - key: ARCHIVE_BATCH
+        value: 50
+      - key: QUALITY_ENABLED
+        value: 1
+      - key: QUALITY_MIN_BYTES
+        value: 300000
+      - key: QUALITY_MIN_WIDTH
+        value: 720
+      - key: QUALITY_MIN_HEIGHT
+        value: 960
+      - key: QUALITY_STRICT
+        value: 0
+      - key: COMMENT_ENABLED
+        value: 0
+      - key: COMMENT_TEXT
+        value: FOLLOW ME 🔥|FOLLOW FOR MORE 🔥|FOLLOW ME ❤️
+      - key: SESSION_REUSE_TTL_MIN
+        value: 120
+      - key: IG_CALL_JITTER_SEC
+        value: 1,3
       - key: HIDELIKE
         value: 1
       - key: BOTLOG
         value: 1
-      - key: THUMBNAIL_URL
-        sync: false
+      - key: FETCH_COUNT
+        value: 30
+      - key: MIN_POST_INTERVAL_MIN
+        value: 30
+      - key: MAX_PER_DAY
+        value: 10
+      - key: LOG_LEVEL
+        value: INFO
