@@ -121,7 +121,7 @@ async def archive(
     views_thresh = config.ARCHIVE_VIEWS if views is None else views
     try:
         summary = await run_archive(time_sec, views_thresh)
-        return {"ok": True, "summary": summary}
+        return {"ok": True, "time_sec": time_sec, "views": views_thresh, "summary": summary}
     except Exception as exc:  # noqa: BLE001
         await tg.notify_error("archive", exc)
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
@@ -132,11 +132,6 @@ async def archive_one(
     key: str = Query(""),
     code: str = Query(""),
 ) -> dict:
-    """Archive a single shortcode immediately, bypassing DB age/views gating.
-
-    Used for posts that were uploaded manually (not tracked in processed_media)
-    or that need one-off archival regardless of age/views policy.
-    """
     _check_key(key)
     from app import ig as igmod
     from app import telegramlog as tg
@@ -151,6 +146,8 @@ async def archive_one(
         summary = await archive_single(cl, shortcode)
         return {"ok": True, "summary": summary}
     except HTTPException:
+        raise
+    except Exception:
         raise
     except Exception as exc:  # noqa: BLE001
         await tg.notify_error("archive_one", exc)

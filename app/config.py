@@ -28,7 +28,7 @@ def _get_first(*names: str, default: str = "") -> str:
     return default
 
 
-def parse_duration_to_seconds(raw: str, default_seconds: int = 12 * 3600) -> int:
+def parse_duration_to_seconds(raw: str, default_seconds: int = 24 * 3600) -> int:
     """Parse '12h', '90m', '2d', '3600', '3600s' -> seconds."""
     if raw is None or str(raw).strip() == "":
         return default_seconds
@@ -63,6 +63,26 @@ def _parse_int_raw(raw: str, default: int, label: str) -> int:
         raise ValueError(f"Invalid int for {label}")
 
 
+def _parse_jitter(raw: str, default: tuple[float, float] = (1.0, 3.0)) -> tuple[float, float]:
+    """Parse 'min,max' seconds (e.g. '1,3') -> (lo, hi) floats."""
+    if raw is None or str(raw).strip() == "":
+        return default
+    s = str(raw).strip().replace(";", ",")
+    parts = [p for p in s.replace(" ", "").split(",") if p != ""]
+    try:
+        if len(parts) == 1:
+            v = float(parts[0])
+            if v < 0:
+                return default
+            return (v, v)
+        lo, hi = float(parts[0]), float(parts[1])
+        if lo < 0 or hi < 0:
+            return default
+        return (min(lo, hi), max(lo, hi))
+    except ValueError:
+        raise ValueError("Invalid jitter range (expected 'min,max' seconds)")
+
+
 def _parse_bool_like(raw: str, default: int) -> int:
     if raw is None or str(raw).strip() == "":
         return default
@@ -88,19 +108,68 @@ TURSO_AUTH_TOKEN: str = _get("TURSO_AUTH_TOKEN", "")
 INSTAGRAM_USERNAME: str = _get("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD: str = _get("INSTAGRAM_PASSWORD", "")
 INSTAGRAM_SESSION_STATE: str = _get("INSTAGRAM_SESSION_STATE", "")
-# WARNING: INSTAGRAM_SESSION / SESSION_ID are raw cookie fragments, NOT
-# aiograpi settings JSON. They are intentionally ignored here. Log in once via
-# INSTAGRAM_USERNAME/INSTAGRAM_PASSWORD so ensure_login() can build proper
-# settings (set_settings BEFORE login) and persist them to session_cache.
-# Documented unused legacy fields: CSRF_TOKEN, DS_USER_ID,
-# DESTINATION_USERNAME (no effect on login/upload/archive).
+
+
+def _clean_session_cookie(raw: str) -> str:
+    """URL-decode a raw cookie value; strip whitespace/quotes. No logging."""
+    if not raw:
+        return ""
+    from urllib.parse import unquote
+
+    s = str(raw).strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return unquote(s).strip().strip("'\" ")
+
+
+# Raw session cookies for sessionid login (bypasses 2FA). These are browser
+# cookies, NOT aiograpi settings JSON (INSTAGRAM_SESSION_STATE). Cookies
+# expire; the username/password path remains as fallback.
+INSTAGRAM_SESSIONID: str = _clean_session_cookie(
+    _get_first("INSTAGRAM_SESSIONID", "SESSION_ID", "INSTAGRAM_SESSION", default="")
+)
+INSTAGRAM_CSRFTOKEN: str = _clean_session_cookie(
+    _get_first("INSTAGRAM_CSRFTOKEN", "CSRF_TOKEN", default="")
+)
+INSTAGRAM_DS_USER_ID: str = _clean_session_cookie(
+    _get_first("INSTAGRAM_DS_USER_ID", "DS_USER_ID", default="")
+)
+# Documented unused legacy field: DESTINATION_USERNAME (no effect).
+
+# 2FA for username/password login on protected accounts. Values are never
+# logged. TOTP seed is the reusable base32 manual-entry key; the one-shot
+# code is a user-supplied 6-digit TOTP or 8-digit backup code.
+
+
+def _clean_secret(raw: str) -> str:
+    """Strip whitespace/quotes from a secret value. Never logged."""
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s.strip().strip("'\" ")
+
+
+INSTAGRAM_TOTP_SEED: str = _clean_secret(_get("INSTAGRAM_TOTP_SEED", "")).replace(" ", "")
+INSTAGRAM_2FA_CODE: str = _clean_secret(_get("INSTAGRAM_2FA_CODE", ""))
 
 TELEGRAM_BOT_TOKEN: str = _get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = _get("TELEGRAM_CHAT_ID", "")
 
-ARCHIVE_TIME_RAW: str = _get("ARCHIVE_TIME", "12h")
-ARCHIVE_TIME_SEC: int = parse_duration_to_seconds(ARCHIVE_TIME_RAW, 12 * 3600)
+ARCHIVE_TIME_RAW: str = _get("ARCHIVE_TIME", "24h")
+ARCHIVE_TIME_SEC: int = parse_duration_to_seconds(ARCHIVE_TIME_RAW, 24 * 3600)
 ARCHIVE_VIEWS: int = _parse_int("ARCHIVE_VIEWS", 1000)
+# DB-limited archive scan size (keeps the free-plan job small).
+ARCHIVE_BATCH: int = _parse_int("ARCHIVE_BATCH", 50)
+
+# In-process authenticated-client reuse (biggest IG-call saver on free plan).
+SESSION_REUSE_TTL_MIN: int = _parse_int("SESSION_REUSE_TTL_MIN", 120)
+
+# Jittered human-like delay before write calls (clip_upload/media_archive)
+# and between paginated reads. Format "min,max" seconds.
+IG_CALL_JITTER_SEC_RAW: str = _get("IG_CALL_JITTER_SEC", "1,3")
+IG_JITTER_MIN, IG_JITTER_MAX = _parse_jitter(IG_CALL_JITTER_SEC_RAW, (1.0, 3.0))
 
 # HIDELIKE canonical int flag; alias HIDE_LIKE_VIEW_COUNTS accepts
 # true/false/1/0 (alias only used when HIDELIKE is empty).
