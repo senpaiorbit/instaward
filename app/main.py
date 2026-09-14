@@ -77,16 +77,19 @@ async def upload(
     thumb: str | None = Query(None),
     attempts: int | None = Query(None, ge=1, le=100),
     amount: int | None = Query(None, ge=1, le=50),
+    comment: int | None = Query(None),
 ) -> dict:
     _check_key(key)
     from app import curation
     from app import telegramlog as tg
 
     hide_flag = None if hidelike is None else bool(hidelike)
+    comment_flag = None if comment is None else bool(comment)
     if amount is None:
         try:
             summary = await curation.run_curation(
-                hide_flag, thumbnail_override=thumb or None, max_attempts=attempts
+                hide_flag, thumbnail_override=thumb or None, max_attempts=attempts,
+                comment=comment_flag,
             )
             return {"ok": True, "summary": summary}
         except curation.RateLimited as exc:
@@ -115,6 +118,7 @@ async def upload(
             "thumbnail_override": thumb or None,
             "max_attempts": attempts,
             "target_count": amount,
+            "comment": comment_flag,
         },
     )
     kwargs = {
@@ -122,9 +126,10 @@ async def upload(
         "thumbnail_override": thumb or None,
         "max_attempts": attempts,
         "target_count": amount,
+        "comment": comment_flag,
     }
     asyncio.create_task(jobsmod.run_upload_job(job["id"], kwargs))
-    return {"ok": True, "job_id": job["id"], "status": "running", "target_count": amount}
+    return {"ok": True, "job_id": job["id"], "status": "running", "target_count": amount, "comment": comment_flag}
 
 
 @app.get("/live")
