@@ -163,6 +163,17 @@ ARCHIVE_VIEWS: int = _parse_int("ARCHIVE_VIEWS", 1000)
 # DB-limited archive scan size (keeps the free-plan job small).
 ARCHIVE_BATCH: int = _parse_int("ARCHIVE_BATCH", 50)
 
+# --- Upload quality gate (resolution + size; Pillow/MP4 probing, no ffmpeg needed) ---
+QUALITY_ENABLED: int = _parse_int("QUALITY_ENABLED", 1)
+QUALITY_MIN_BYTES: int = _parse_int("QUALITY_MIN_BYTES", 300000)
+QUALITY_MIN_WIDTH: int = _parse_int("QUALITY_MIN_WIDTH", 720)
+QUALITY_MIN_HEIGHT: int = _parse_int("QUALITY_MIN_HEIGHT", 960)
+QUALITY_STRICT: int = _parse_int("QUALITY_STRICT", 0)
+
+# --- Auto-comment engine (posts CTA comment on our own uploads, pins it) ---
+COMMENT_ENABLED: int = _parse_int("COMMENT_ENABLED", 1)
+COMMENT_TEXT: str = _get("COMMENT_TEXT", "FOLLOW ME")
+
 # In-process authenticated-client reuse (biggest IG-call saver on free plan).
 SESSION_REUSE_TTL_MIN: int = _parse_int("SESSION_REUSE_TTL_MIN", 120)
 
