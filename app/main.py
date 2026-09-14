@@ -76,24 +76,55 @@ async def upload(
     botlog: int | None = Query(None),
     thumb: str | None = Query(None),
     attempts: int | None = Query(None, ge=1, le=100),
+    amount: int | None = Query(None, ge=1, le=50),
 ) -> dict:
     _check_key(key)
     from app import curation
     from app import telegramlog as tg
 
     hide_flag = None if hidelike is None else bool(hidelike)
-    try:
-        summary = await curation.run_curation(
-            hide_flag, thumbnail_override=thumb or None, max_attempts=attempts
-        )
-        return {"ok": True, "summary": summary}
-    except curation.RateLimited as exc:
-        raise HTTPException(status_code=429, detail=exc.detail)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        await tg.notify_error("upload", exc)
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+    if amount is None:
+        try:
+            summary = await curation.run_curation(
+                hide_flag, thumbnail_override=thumb or None, max_attempts=attempts
+            )
+            return {"ok": True, "summary": summary}
+        except curation.RateLimited as exc:
+            raise HTTPException(status_code=429, detail=exc.detail)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await tg.notify_error("upload", exc)
+            raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+    from app import jobs as jobsmod
+
+    existing = jobsmod.current_running("upload")
+    jobsmod.prune()
+    if existing:
+        return {
+            "ok": True,
+            "job_id": existing["id"],
+            "status": "running",
+            "target_count": amount,
+            "note": "already running",
+        }
+    job = jobsmod.create_job(
+        "upload",
+        {
+            "hide_flag": hide_flag,
+            "thumbnail_override": thumb or None,
+            "max_attempts": attempts,
+            "target_count": amount,
+        },
+    )
+    kwargs = {
+        "hide_like": hide_flag,
+        "thumbnail_override": thumb or None,
+        "max_attempts": attempts,
+        "target_count": amount,
+    }
+    asyncio.create_task(jobsmod.run_upload_job(job["id"], kwargs))
+    return {"ok": True, "job_id": job["id"], "status": "running", "target_count": amount}
 
 
 @app.get("/live")

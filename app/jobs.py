@@ -73,3 +73,16 @@ async def run_archive_job(job_id: str, time_sec: int, views_thresh: int) -> None
         job.update(status="done", finished_at=_now_iso(), result=summary)
     except Exception as exc:  # noqa: BLE001
         job.update(status="error", finished_at=_now_iso(), error=f"{type(exc).__name__}: {exc}")
+
+
+async def run_upload_job(job_id: str, kwargs: dict) -> None:
+    from app import curation as curmod
+
+    job = _JOBS.get(job_id)
+    if job is None:
+        return
+    try:
+        summary = await curmod.run_curation(job=job, **kwargs)
+        job.update(status="done", finished_at=_now_iso(), result=summary)
+    except Exception as exc:  # noqa: BLE001
+        job.update(status="error", finished_at=_now_iso(), error=f"{type(exc).__name__}: {exc}")
