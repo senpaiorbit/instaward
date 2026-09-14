@@ -51,6 +51,15 @@ def _connect():
     return libsql.connect(**kwargs)
 
 
+def _table_columns_sync(con, table: str) -> set[str]:
+    """Column names for a table (empty set on any error). Never raises."""
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(r[1]) for r in rows}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _init_db_sync() -> None:
     con = _connect()
     try:
@@ -63,10 +72,17 @@ def _init_db_sync() -> None:
             try:
                 con.execute(_ddl)
                 con.commit()
+                log.info("migration applied: %s", _ddl)
             except Exception as exc:  # noqa: BLE001
                 if "duplicate" in str(exc).lower():
                     continue
                 log.warning("migration %s failed: %s", _ddl, exc)
+        cols = _table_columns_sync(con, "processed_media")
+        missing = {"repost_code", "repost_pk"} - cols
+        if missing:
+            log.warning("schema verify FAILED, missing columns: %s", sorted(missing))
+        else:
+            log.info("schema verify ok: processed_media has repost columns")
     finally:
         con.close()
 
