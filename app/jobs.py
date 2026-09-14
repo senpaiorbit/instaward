@@ -62,14 +62,14 @@ def prune(keep: int = 20) -> None:
         _JOBS.pop(old.get("id", ""), None)
 
 
-async def run_archive_job(job_id: str, time_sec: int, views_thresh: int) -> None:
+async def run_archive_job(job_id: str, time_sec: int, views_thresh: int, all_flag: bool = False) -> None:
     from app import archive as archmod
 
     job = _JOBS.get(job_id)
     if job is None:
         return
     try:
-        summary = await archmod.run_archive(time_sec, views_thresh, job=job)
+        summary = await archmod.run_archive(time_sec, views_thresh, job=job, all=all_flag)
         job.update(status="done", finished_at=_now_iso(), result=summary)
     except Exception as exc:  # noqa: BLE001
         job.update(status="error", finished_at=_now_iso(), error=f"{type(exc).__name__}: {exc}")

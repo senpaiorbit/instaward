@@ -155,6 +155,33 @@ def _get_archive_candidates_sync(limit: int = 50) -> list[dict[str, Any]]:
         con.close()
 
 
+def _get_unarchived_sync(limit: int = 50) -> list[dict[str, Any]]:
+    con = _connect()
+    try:
+        rows = con.execute(
+            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned,"
+            " repost_code, repost_pk"
+            " FROM processed_media WHERE archived = 0"
+            " ORDER BY published_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "media_code": r[0],
+                "author_username": r[1],
+                "original_url": r[2],
+                "published_at": r[3],
+                "archived": r[4],
+                "archive_scanned": r[5],
+                "repost_code": r[6] if len(r) > 6 else None,
+                "repost_pk": r[7] if len(r) > 7 else None,
+            }
+            for r in rows
+        ]
+    finally:
+        con.close()
+
+
 def _mark_archived_sync(code: str, archived: int = 1) -> None:
     con = _connect()
     try:
@@ -263,6 +290,11 @@ async def get_unscanned(limit: int = 50) -> list[dict[str, Any]]:
 
 async def get_archive_candidates(limit: int = 50) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_get_archive_candidates_sync, limit)
+
+
+async def get_unarchived(limit: int = 50) -> list[dict[str, Any]]:
+    """All rows with archived=0 (any scan state), for all-mode sweeps."""
+    return await asyncio.to_thread(_get_unarchived_sync, limit)
 
 
 async def mark_archived(code: str, archived: int = 1) -> None:
