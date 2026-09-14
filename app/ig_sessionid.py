@@ -6,6 +6,9 @@ password login (TOTP seed or one-shot code) when cookies are absent/expired,
 (3) backfilled newer helpers (jitter_delay / is_auth_error /
 mark_session_stale) when the deployed app/ig.py predates them. Falls through
 to the original password flow when nothing is configured. No secrets logged.
+
+When app/ig.py already implements sessionid-first + 2FA login internally
+(has _try_sessionid_login), install_sessionid_first() is a no-op.
 """
 import asyncio
 import inspect
@@ -339,13 +342,20 @@ def _install_compat_helpers() -> None:
 
 
 def install_sessionid_first() -> None:
-    """Wrap app.ig.ensure_login: cookies, then 2FA password, then original."""
+    """Wrap app.ig.ensure_login: cookies, then 2FA password, then original.
+
+    No-op when app/ig.py already implements sessionid-first + 2FA login
+    internally (detected via _try_sessionid_login) to avoid double attempts.
+    """
     _install_compat_helpers()
     try:
         from app import db as dbmod
         from app import ig as igmod
     except Exception as exc:  # noqa: BLE001 - never break import
         log.warning("sessionid patch skipped (import): %s", exc)
+        return
+    if hasattr(igmod, "_try_sessionid_login"):
+        log.info("sessionid-first already built into app.ig; shim skipped")
         return
     if getattr(igmod.ensure_login, "_sessionid_patched", False):
         return
