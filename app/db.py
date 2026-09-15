@@ -38,21 +38,84 @@ def _load_schema_sql() -> str:
     return _FALLBACK_SCHEMA
 
 
+def _resolve_turso_creds() -> tuple[str, str]:
+    """Return clean (url, token) handling common paste mistakes. Never logs secrets."""
+    raw_url = (os.environ.get("TURSO_URL", "") or "").strip().strip("'\" ")
+    raw_tok = (os.environ.get("TURSO_AUTH_TOKEN", "") or "").strip().strip("'\" ")
+    url = raw_url
+    tok = raw_tok
+    if "," in url and url.strip().startswith("libsql://"):
+        u, t = url.split(",", 1)
+        url = u.strip().strip("'\" ")
+        if not tok:
+            tok = t.strip().strip("'\" ")
+    if tok.startswith("libsql://") or "," in tok:
+        if "," in tok:
+            tok = tok.rsplit(",", 1)[-1].strip().strip("'\" ")
+        elif tok.startswith("libsql://"):
+            tok = ""
+    if "authToken=" in tok:
+        tok = tok.split("authToken=", 1)[-1].split("&")[0].strip().strip("'\" ")
+    return url.strip(), tok.strip()
+
+
+def _is_turso_auth_error(exc: BaseException) -> bool:
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return ("invalidtoken" in blob or "jwt" in blob) and ("hrana" in blob or "turso" in blob or "auth" in blob)
+
+
+def _turso_error_hint() -> str:
+    return (
+        "Hrana rejected the auth token (JWT InvalidToken). Common causes:\n"
+        "1. TURSO_AUTH_TOKEN is expired — regenerate it from the Turso dashboard "
+        "(DB → Settings → Token) and paste ONLY the token, not the full "
+        "'libsql://URL,token' string.\n"
+        "2. TURSO_AUTH_TOKEN was set to the Turso API key (the one with "
+        "'org_id'); it must be the per-database token.\n"
+        "3. TURSO_URL points to a DB that was deleted or moved."
+    )
+
+
 def _connect():
     import libsql
 
-    url = os.environ.get("TURSO_URL", "")
-    token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    url, token = _resolve_turso_creds()
     if not url:
         raise RuntimeError("TURSO_URL is not set")
     kwargs: dict[str, Any] = {"database": url}
     if token:
         kwargs["auth_token"] = token
-    return libsql.connect(**kwargs)
+    try:
+        return libsql.connect(**kwargs)
+    except Exception as exc:  # noqa: BLE001
+        if _is_turso_auth_error(exc):
+            hint = _turso_error_hint()
+            raise RuntimeError(f"Turso auth failed (JWT InvalidToken): {exc}\n{hint}") from exc
+        raise
+
+
+def db_health_sync() -> dict[str, Any]:
+    try:
+        con = _connect()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "hint": _turso_error_hint()}
+    try:
+        con.execute("SELECT 1").fetchall()
+        con.close()
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        try:
+            con.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "hint": _turso_error_hint()}
+
+
+async def db_health() -> dict[str, Any]:
+    return await asyncio.to_thread(db_health_sync)
 
 
 def _table_columns_sync(con, table: str) -> set[str]:
-    """Column names for a table (empty set on any error). Never raises."""
     try:
         rows = con.execute(f"PRAGMA table_info({table})").fetchall()
         return {str(r[1]) for r in rows}
@@ -91,8 +154,8 @@ def _insert_processed_sync(code: str, author: str, original_url: str = "", cache
     con = _connect()
     try:
         con.execute(
-            "INSERT OR IGNORE INTO processed_media"
-            "(media_code, author_username, original_url, cached_download_url) VALUES (?,?,?,?)",
+            "INSERT OR IGNORE INTO processed_media(médía_code, author_username, original_url, cached_download_url) VALUES (?,?,?,?)" if False else
+            "INSERT OR IGNORE INTO processed_media(media_code, author_username, original_url, cached_download_url) VALUES (?,?,?,?)",
             (code, author, original_url or "", cached_url or ""),
         )
         con.commit()
@@ -122,24 +185,10 @@ def _get_recent_sync(limit: int = 5) -> list[dict[str, Any]]:
     con = _connect()
     try:
         rows = con.execute(
-            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned,"
-            " repost_code, repost_pk"
-            " FROM processed_media ORDER BY published_at DESC LIMIT ?",
+            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned, repost_code, repost_pk FROM processed_media ORDER BY published_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [
-            {
-                "media_code": r[0],
-                "author_username": r[1],
-                "original_url": r[2],
-                "published_at": r[3],
-                "archived": r[4],
-                "archive_scanned": r[5],
-                "repost_code": r[6] if len(r) > 6 else None,
-                "repost_pk": r[7] if len(r) > 7 else None,
-            }
-            for r in rows
-        ]
+        return [{"media_code": r[0], "author_username": r[1], "original_url": r[2], "published_at": r[3], "archived": r[4], "archive_scanned": r[5], "repost_code": r[6] if len(r) > 6 else None, "repost_pk": r[7] if len(r) > 7 else None} for r in rows]
     finally:
         con.close()
 
@@ -147,26 +196,8 @@ def _get_recent_sync(limit: int = 5) -> list[dict[str, Any]]:
 def _get_archive_candidates_sync(limit: int = 50) -> list[dict[str, Any]]:
     con = _connect()
     try:
-        rows = con.execute(
-            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned,"
-            " repost_code, repost_pk"
-            " FROM processed_media WHERE archived = 0 AND archive_scanned = 0"
-            " ORDER BY published_at ASC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [
-            {
-                "media_code": r[0],
-                "author_username": r[1],
-                "original_url": r[2],
-                "published_at": r[3],
-                "archived": r[4],
-                "archive_scanned": r[5],
-                "repost_code": r[6] if len(r) > 6 else None,
-                "repost_pk": r[7] if len(r) > 7 else None,
-            }
-            for r in rows
-        ]
+        rows = con.execute("SELECT media_code, author_username, original_url, published_at, archived, archive_scanned, repost_code, repost_pk FROM processed_media WHERE archived = 0 AND archive_scanned = 0 ORDER BY published_at ASC LIMIT ?", (limit,)).fetchall()
+        return [{"media_code": r[0], "author_username": r[1], "original_url": r[2], "published_at": r[3], "archived": r[4], "archive_scanned": r[5], "repost_code": r[6] if len(r) > 6 else None, "repost_pk": r[7] if len(r) > 7 else None} for r in rows]
     finally:
         con.close()
 
@@ -174,26 +205,8 @@ def _get_archive_candidates_sync(limit: int = 50) -> list[dict[str, Any]]:
 def _get_unarchived_sync(limit: int = 50) -> list[dict[str, Any]]:
     con = _connect()
     try:
-        rows = con.execute(
-            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned,"
-            " repost_code, repost_pk"
-            " FROM processed_media WHERE archived = 0"
-            " ORDER BY published_at ASC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [
-            {
-                "media_code": r[0],
-                "author_username": r[1],
-                "original_url": r[2],
-                "published_at": r[3],
-                "archived": r[4],
-                "archive_scanned": r[5],
-                "repost_code": r[6] if len(r) > 6 else None,
-                "repost_pk": r[7] if len(r) > 7 else None,
-            }
-            for r in rows
-        ]
+        rows = con.execute("SELECT media_code, author_username, original_url, published_at, archived, archive_scanned, repost_code, repost_pk FROM processed_media WHERE archived = 0 ORDER BY published_at ASC LIMIT ?", (limit,)).fetchall()
+        return [{"media_code": r[0], "author_username": r[1], "original_url": r[2], "published_at": r[3], "archived": r[4], "archive_scanned": r[5], "repost_code": r[6] if len(r) > 6 else None, "repost_pk": r[7] if len(r) > 7 else None} for r in rows]
     finally:
         con.close()
 
@@ -201,10 +214,7 @@ def _get_unarchived_sync(limit: int = 50) -> list[dict[str, Any]]:
 def _mark_archived_sync(code: str, archived: int = 1) -> None:
     con = _connect()
     try:
-        con.execute(
-            "UPDATE processed_media SET archived = ?, archive_scanned = 1 WHERE media_code = ?",
-            (1 if archived else 0, code),
-        )
+        con.execute("UPDATE processed_media SET archived = ?, archive_scanned = 1 WHERE media_code = ?", (1 if archived else 0, code))
         con.commit()
     finally:
         con.close()
@@ -213,10 +223,7 @@ def _mark_archived_sync(code: str, archived: int = 1) -> None:
 def _mark_scanned_sync(code: str, archived: int = 0) -> None:
     con = _connect()
     try:
-        con.execute(
-            "UPDATE processed_media SET archived = ?, archive_scanned = 1 WHERE media_code = ?",
-            (1 if archived else 0, code),
-        )
+        con.execute("UPDATE processed_media SET archived = ?, archive_scanned = 1 WHERE media_code = ?", (1 if archived else 0, code))
         con.commit()
     finally:
         con.close()
@@ -225,10 +232,7 @@ def _mark_scanned_sync(code: str, archived: int = 0) -> None:
 def _update_repost_sync(code: str, repost_code: str, repost_pk: str) -> None:
     con = _connect()
     try:
-        con.execute(
-            "UPDATE processed_media SET repost_code = ?, repost_pk = ? WHERE media_code = ?",
-            (repost_code, repost_pk, code),
-        )
+        con.execute("UPDATE processed_media SET repost_code = ?, repost_pk = ? WHERE media_code = ?", (repost_code, repost_pk, code))
         con.commit()
     finally:
         con.close()
@@ -237,9 +241,7 @@ def _update_repost_sync(code: str, repost_code: str, repost_pk: str) -> None:
 def _last_published_at_sync() -> Optional[str]:
     con = _connect()
     try:
-        rows = con.execute(
-            "SELECT published_at FROM processed_media ORDER BY published_at DESC LIMIT 1"
-        ).fetchall()
+        rows = con.execute("SELECT published_at FROM processed_media ORDER BY published_at DESC LIMIT 1").fetchall()
         return rows[0][0] if rows else None
     finally:
         con.close()
@@ -248,9 +250,7 @@ def _last_published_at_sync() -> Optional[str]:
 def _count_today_sync() -> int:
     con = _connect()
     try:
-        rows = con.execute(
-            "SELECT COUNT(*) FROM processed_media WHERE date(published_at) = date('now')"
-        ).fetchall()
+        rows = con.execute("SELECT COUNT(*) FROM processed_media WHERE date(published_at) = date('now')").fetchall()
         return int(rows[0][0]) if rows else 0
     finally:
         con.close()
@@ -259,12 +259,7 @@ def _count_today_sync() -> int:
 def _save_session_sync(key: str, state_json: str) -> None:
     con = _connect()
     try:
-        con.execute(
-            "INSERT INTO session_cache(key, state_json, updated_at) VALUES (?,?,CURRENT_TIMESTAMP)"
-            " ON CONFLICT(key) DO UPDATE SET state_json=excluded.state_json,"
-            " updated_at=CURRENT_TIMESTAMP",
-            (key, state_json),
-        )
+        con.execute("INSERT INTO session_cache(key, state_json, updated_at) VALUES (?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET state_json=excluded.state_json, updated_at=CURRENT_TIMESTAMP", (key, state_json))
         con.commit()
     finally:
         con.close()
@@ -300,7 +295,6 @@ async def get_recent(limit: int = 5) -> list[dict[str, Any]]:
 
 
 async def get_unscanned(limit: int = 50) -> list[dict[str, Any]]:
-    """Alias used by archive job: rows with archived=0 AND archive_scanned=0."""
     return await asyncio.to_thread(_get_archive_candidates_sync, limit)
 
 
@@ -309,7 +303,6 @@ async def get_archive_candidates(limit: int = 50) -> list[dict[str, Any]]:
 
 
 async def get_unarchived(limit: int = 50) -> list[dict[str, Any]]:
-    """All rows with archived=0 (any scan state), for all-mode sweeps."""
     return await asyncio.to_thread(_get_unarchived_sync, limit)
 
 

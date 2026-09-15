@@ -1,5 +1,4 @@
 """FastAPI entrypoint. Import-safe: scheduler starts in lifespan, no IG at import."""
-# archive_one bypass endpoint added 2026-09-14
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -19,13 +18,33 @@ def _check_key(key: str) -> None:
         raise HTTPException(status_code=403, detail="forbidden")
 
 
+async def _turso_precheck() -> None:
+    from app import db as dbmod
+
+    health = await dbmod.db_health()
+    if not health.get("ok"):
+        msg = health.get("error", "db unreachable")
+        hint = health.get("hint", "")
+        detail = f"Turso DB unreachable: {msg}"
+        if hint:
+            detail += f"\n{hint}"
+        raise HTTPException(status_code=503, detail=detail)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app import db as dbmod
 
     try:
         await dbmod.init_db()
-    except Exception as exc:  # noqa: BLE001 - DB may be unconfigured locally
+        h = await dbmod.db_health()
+        if h.get("ok"):
+            log.info("db health ok at startup")
+        else:
+            log.warning("db health FAILED at startup: %s", h.get("error"))
+            if h.get("hint"):
+                log.warning("%s", h.get("hint"))
+    except Exception as exc:  # noqa: BLE001
         log.warning("init_db failed at startup: %s", exc)
     scheduler = None
     try:
@@ -69,6 +88,36 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/turso_check")
+async def turso_check(key: str = Query("")) -> dict:
+    _check_key(key)
+    from app import db as dbmod
+
+    h = await dbmod.db_health()
+    return {"ok": h.get("ok", False), "health": h}
+
+
+@app.get("/reconnect")
+async def reconnect(key: str = Query("")) -> dict:
+    _check_key(key)
+    from app import db as dbmod
+    from app import ig as igmod
+
+    h = await dbmod.db_health()
+    if not h.get("ok"):
+        raise HTTPException(status_code=503, detail=f"Turso DB unreachable: {h.get('error')}\n{h.get('hint','')}")
+    try:
+        igmod.mark_session_stale()
+    except Exception:
+        pass
+    try:
+        cl = await igmod.ensure_login()
+        uid = str(getattr(cl, "user_id", "") or "")
+        return {"ok": True, "reconnected": True, "user_id": uid}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+
+
 @app.get("/upload")
 async def upload(
     key: str = Query(""),
@@ -80,6 +129,7 @@ async def upload(
     comment: int | None = Query(None),
 ) -> dict:
     _check_key(key)
+    await _turso_precheck()
     from app import curation
     from app import telegramlog as tg
 
@@ -87,16 +137,18 @@ async def upload(
     comment_flag = None if comment is None else bool(comment)
     if amount is None:
         try:
-            summary = await curation.run_curation(
-                hide_flag, thumbnail_override=thumb or None, max_attempts=attempts,
-                comment=comment_flag,
-            )
+            summary = await curation.run_curation(hide_flag, thumbnail_override=thumb or None, max_attempts=attempts, comment=comment_flag)
             return {"ok": True, "summary": summary}
         except curation.RateLimited as exc:
             raise HTTPException(status_code=429, detail=exc.detail)
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001
+            blob = f"{type(exc).__name__} {exc}".lower()
+            if "invalidtoken" in blob or ("jwt" in blob and "hrana" in blob):
+                from app.db import _turso_error_hint
+
+                raise HTTPException(status_code=503, detail=f"Turso auth failed: {exc}\n{_turso_error_hint()}")
             await tg.notify_error("upload", exc)
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
     from app import jobs as jobsmod
@@ -104,30 +156,9 @@ async def upload(
     existing = jobsmod.current_running("upload")
     jobsmod.prune()
     if existing:
-        return {
-            "ok": True,
-            "job_id": existing["id"],
-            "status": "running",
-            "target_count": amount,
-            "note": "already running",
-        }
-    job = jobsmod.create_job(
-        "upload",
-        {
-            "hide_flag": hide_flag,
-            "thumbnail_override": thumb or None,
-            "max_attempts": attempts,
-            "target_count": amount,
-            "comment": comment_flag,
-        },
-    )
-    kwargs = {
-        "hide_like": hide_flag,
-        "thumbnail_override": thumb or None,
-        "max_attempts": attempts,
-        "target_count": amount,
-        "comment": comment_flag,
-    }
+        return {"ok": True, "job_id": existing["id"], "status": "running", "target_count": amount, "note": "already running"}
+    job = jobsmod.create_job("upload", {"hide_flag": hide_flag, "thumbnail_override": thumb or None, "max_attempts": attempts, "target_count": amount, "comment": comment_flag})
+    kwargs = {"hide_like": hide_flag, "thumbnail_override": thumb or None, "max_attempts": attempts, "target_count": amount, "comment": comment_flag}
     asyncio.create_task(jobsmod.run_upload_job(job["id"], kwargs))
     return {"ok": True, "job_id": job["id"], "status": "running", "target_count": amount, "comment": comment_flag}
 
@@ -135,6 +166,7 @@ async def upload(
 @app.get("/live")
 async def live(key: str = Query("")) -> dict:
     _check_key(key)
+    await _turso_precheck()
     from app import db as dbmod
 
     rows = await dbmod.get_recent(5)
@@ -142,14 +174,9 @@ async def live(key: str = Query("")) -> dict:
 
 
 @app.get("/archive")
-async def archive(
-    key: str = Query(""),
-    time: str | None = Query(None),
-    views: int | None = Query(None),
-    wait: int | None = Query(None),
-    all: int | None = Query(None),
-) -> dict:
+async def archive(key: str = Query(""), time: str | None = Query(None), views: int | None = Query(None), wait: int | None = Query(None), all: int | None = Query(None)) -> dict:
     _check_key(key)
+    await _turso_precheck()
     from app import telegramlog as tg
     from app.archive import run_archive
 
@@ -171,32 +198,14 @@ async def archive(
     existing = jobsmod.current_running("archive")
     jobsmod.prune()
     if existing:
-        return {
-            "ok": True,
-            "job_id": existing["id"],
-            "status": "running",
-            "time_sec": time_sec,
-            "views": views_thresh,
-            "all": all_flag,
-            "note": "already running",
-        }
+        return {"ok": True, "job_id": existing["id"], "status": "running", "time_sec": time_sec, "views": views_thresh, "all": all_flag, "note": "already running"}
     job = jobsmod.create_job("archive", {"time_sec": time_sec, "views": views_thresh, "all": all_flag})
     asyncio.create_task(jobsmod.run_archive_job(job["id"], time_sec, views_thresh, all_flag))
-    return {
-        "ok": True,
-        "job_id": job["id"],
-        "status": "running",
-        "time_sec": time_sec,
-        "views": views_thresh,
-        "all": all_flag,
-    }
+    return {"ok": True, "job_id": job["id"], "status": "running", "time_sec": time_sec, "views": views_thresh, "all": all_flag}
 
 
 @app.get("/a_job")
-async def a_job(
-    key: str = Query(""),
-    id: str = Query(""),
-) -> dict:
+async def a_job(key: str = Query(""), id: str = Query("")) -> dict:
     _check_key(key)
     from app import jobs as jobsmod
 
@@ -207,11 +216,9 @@ async def a_job(
 
 
 @app.get("/archive_one")
-async def archive_one(
-    key: str = Query(""),
-    code: str = Query(""),
-) -> dict:
+async def archive_one(key: str = Query(""), code: str = Query("")) -> dict:
     _check_key(key)
+    await _turso_precheck()
     from app import ig as igmod
     from app import telegramlog as tg
     from app.archive import archive_single
