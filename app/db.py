@@ -128,10 +128,7 @@ def _init_db_sync() -> None:
     try:
         con.executescript(_load_schema_sql())
         con.commit()
-        for _ddl in (
-            "ALTER TABLE processed_media ADD COLUMN repost_code TEXT",
-            "ALTER TABLE processed_media ADD COLUMN repost_pk TEXT",
-        ):
+        for _ddl in ("ALTER TABLE processed_media ADD COLUMN repost_code TEXT", "ALTER TABLE processed_media ADD COLUMN repost_pk TEXT"):
             try:
                 con.execute(_ddl)
                 con.commit()
@@ -153,11 +150,7 @@ def _init_db_sync() -> None:
 def _insert_processed_sync(code: str, author: str, original_url: str = "", cached_url: str = "") -> None:
     con = _connect()
     try:
-        con.execute(
-            "INSERT OR IGNORE INTO processed_media(médía_code, author_username, original_url, cached_download_url) VALUES (?,?,?,?)" if False else
-            "INSERT OR IGNORE INTO processed_media(media_code, author_username, original_url, cached_download_url) VALUES (?,?,?,?)",
-            (code, author, original_url or "", cached_url or ""),
-        )
+        con.execute("INSERT OR IGNORE INTO processed_media(media_code, author_username, original_url, cached_download_url) VALUES (?,?,?,?)", (code, author, original_url or "", cached_url or ""))
         con.commit()
     finally:
         con.close()
@@ -184,10 +177,7 @@ def _get_processed_authors_sync() -> set[str]:
 def _get_recent_sync(limit: int = 5) -> list[dict[str, Any]]:
     con = _connect()
     try:
-        rows = con.execute(
-            "SELECT media_code, author_username, original_url, published_at, archived, archive_scanned, repost_code, repost_pk FROM processed_media ORDER BY published_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = con.execute("SELECT media_code, author_username, original_url, published_at, archived, archive_scanned, repost_code, repost_pk FROM processed_media ORDER BY published_at DESC LIMIT ?", (limit,)).fetchall()
         return [{"media_code": r[0], "author_username": r[1], "original_url": r[2], "published_at": r[3], "archived": r[4], "archive_scanned": r[5], "repost_code": r[6] if len(r) > 6 else None, "repost_pk": r[7] if len(r) > 7 else None} for r in rows]
     finally:
         con.close()
